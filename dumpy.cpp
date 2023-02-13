@@ -26,7 +26,7 @@ void extract_executables(const std::string& input_path, const std::string& outpu
         // Search for MZ header.
         const char* mz_header = &data[pos];
         const char* mz_magic = "MZ";
-        const size_t mz_magic_size = strlen(mz_magic);
+        const size_t mz_magic_size = 2; // MZ header is always 2 bytes long.
         if (memcmp(mz_header, mz_magic, mz_magic_size) != 0) {
             pos++;
             continue;
@@ -34,6 +34,10 @@ void extract_executables(const std::string& input_path, const std::string& outpu
 
         // Extract PE file size.
         const uint32_t pe_size = *reinterpret_cast<const uint32_t*>(&data[pos + 0x8]);
+        if (pe_size == 0 || pos + pe_size > size || pe_size > 100000000) {
+            pos++;
+            continue;
+        }
         const size_t file_size = pe_size + 0x200; // PE size + MZ header size.
 
         // Extract PE file data.
