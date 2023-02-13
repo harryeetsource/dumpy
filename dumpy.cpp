@@ -3,10 +3,9 @@
 #include <vector>
 #include <string>
 #include <experimental/filesystem>
+#include <cstring>
 
 namespace fs = std::experimental::filesystem;
-
-const uint64_t MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 
 void extract_executables(const std::string& input_path, const std::string& output_path) {
     std::ifstream input_file(input_path, std::ios::binary);
@@ -24,21 +23,32 @@ void extract_executables(const std::string& input_path, const std::string& outpu
     size_t pos = 0;
     int count = 0;
     while (pos < size) {
-        const char* file_data = &data[pos];
-        size_t file_size = size - pos;
-        std::string filename = output_path + std::to_string(count) + ".exe";
-        if (file_size > MAX_FILE_SIZE) {
-            std::cerr << "Skipping file: " << filename << " (file too large)" << std::endl;
-        } else {
-            std::ofstream output_file(filename, std::ios::binary);
-            if (output_file) {
-                output_file.write(file_data, file_size);
-                output_file.close();
-                std::cout << "Extracted file: " << filename << std::endl;
-            } else {
-                std::cerr << "Failed to open output file: " << filename << std::endl;
-            }
+        // Search for MZ header.
+        const char* mz_header = &data[pos];
+        const char* mz_magic = "MZ";
+        const size_t mz_magic_size = strlen(mz_magic);
+        if (memcmp(mz_header, mz_magic, mz_magic_size) != 0) {
+            pos++;
+            continue;
         }
+
+        // Extract PE file size.
+        const uint32_t pe_size = *reinterpret_cast<const uint32_t*>(&data[pos + 0x8]);
+        const size_t file_size = pe_size + 0x200; // PE size + MZ header size.
+
+        // Extract PE file data.
+        const char* file_data = &data[pos];
+        std::string filename = output_path + std::to_string(count) + ".exe";
+
+        std::ofstream output_file(filename, std::ios::binary);
+        if (output_file) {
+            output_file.write(file_data, file_size);
+            output_file.close();
+            std::cout << "Extracted file: " << filename << std::endl;
+        } else {
+            std::cerr << "Failed to open output file: " << filename << std::endl;
+        }
+
         count++;
         pos += file_size;
     }
