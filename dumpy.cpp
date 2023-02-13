@@ -32,13 +32,25 @@ void extract_executables(const std::string& input_path, const std::string& outpu
             continue;
         }
 
-        // Extract PE file size.
-        const uint32_t pe_size = *reinterpret_cast<const uint32_t*>(&data[pos + 0x8]);
-        if (pe_size == 0 || pos + pe_size > size || pe_size > 100000000) {
+        // Check for valid DOS executable format.
+        const char* pe_header = &data[pos + 0x3C];
+        const uint32_t pe_offset = *reinterpret_cast<const uint32_t*>(pe_header);
+        const char* pe_signature = &data[pos + pe_offset];
+        const char* pe_magic = "PE\0\0";
+        const size_t pe_magic_size = 4; // PE signature is always 4 bytes long.
+        if (pe_offset == 0 || pos + pe_offset + pe_magic_size > size ||
+            memcmp(pe_signature, pe_magic, pe_magic_size) != 0) {
             pos++;
             continue;
         }
-        const size_t file_size = pe_size + 0x200; // PE size + MZ header size.
+
+        // Extract PE file size.
+        const uint32_t pe_size = *reinterpret_cast<const uint32_t*>(&data[pos + pe_offset + 0x50]);
+        if (pe_size == 0 || pos + pe_offset + pe_size > size || pe_size > 100000000) {
+            pos++;
+            continue;
+        }
+        const size_t file_size = pe_size + pe_offset;
 
         // Extract PE file data.
         const char* file_data = &data[pos];
