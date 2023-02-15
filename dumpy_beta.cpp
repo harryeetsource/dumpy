@@ -7,7 +7,7 @@
 #include <condition_variable>
 #include <queue>
 #include <algorithm>
-
+#include <functional>
 #include <cstdint>
 #include <cstring>
 
