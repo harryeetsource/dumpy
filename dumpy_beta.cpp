@@ -111,4 +111,51 @@ void find_pe_offsets(const std::vector<char>& data, size_t size, std::vector<uin
 }
 
 // Extract a single PE file from the memory dump
-void extract
+void extract_pe(const std::vector<char>& data, uint32_t offset, const std::string& output_dir) {
+const char* buffer = &data[0];
+// Get the size of the PE file
+uint32_t size_of_image = *reinterpret_cast<const uint32_t *>(buffer + offset + 0x50);
+ // Write the PE file to disk
+std::string output_file = output_dir + "/pe_" + std::to_string(offset) + ".exe";
+std::ofstream file(output_file, std::ios::binary);
+file.write(buffer + offset, size_of_image);
+}
+// Extract all PE files from the memory dump using threadpooling
+void extract_pe_files(const std::vector<char>& data, const std::vector<uint32_t>& pe_offsets, const std::string& output_dir, size_t num_threads) {
+ThreadPool thread_pool(num_threads);
+    for (auto offset : pe_offsets) {
+    thread_pool.enqueue(extract_pe, data, offset, output_dir);
+}
+}
+int main(int argc, char** argv) {
+if (argc != 4) {
+std::cerr << "Usage: " << argv[0] << " <input file> <output dir> <num threads>" << std::endl;
+return 1;
+}
+    std::string input_file = argv[1];
+std::string output_dir = argv[2];
+size_t num_threads = std::stoi(argv[3]);
+
+// Read the memory dump file into a vector
+std::vector<char> data;
+std::ifstream file(input_file, std::ios::binary | std::ios::ate);
+if (file.is_open()) {
+    size_t size = file.tellg();
+    data.resize(size);
+    file.seekg(0, std::ios::beg);
+    file.read(data.data(), size);
+    file.close();
+} else {
+    std::cerr << "Error: could not open file: " << input_file << std::endl;
+    return 1;
+}
+
+// Find the offsets of all PE files in the memory dump
+std::vector<uint32_t> pe_offsets;
+find_pe_offsets(data, data.size(), pe_offsets);
+
+// Extract all PE files from the memory dump
+extract_pe_files(data, pe_offsets, output_dir, num_threads);
+
+return 0;
+}
