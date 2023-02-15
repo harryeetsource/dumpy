@@ -96,18 +96,18 @@ bool validate_pe_signature(const char *buffer, uint32_t size) {
 
 // Find the offsets of all PE files in the memory dump
 void find_pe_offsets(const std::vector<char>& data, size_t size, std::vector<uint32_t>& pe_offsets) {
-    const char* buffer = &data[0];
-    size_t max_offset = size - 0x1000;
-    for (size_t i = 0; i < max_offset; ++i) {
-        if (validate_dos_header(buffer + i)) {
-            uint32_t pe_offset = *reinterpret_cast<const uint32_t *>(buffer + i + 0x3c);
-            if (i + pe_offset + 4 < size) {
-                if (validate_pe_signature(buffer + i + pe_offset, size - i - pe_offset)) {
-                    pe_offsets.push_back(i + pe_offset);
-                }
-            }
-        }
-    }
+const char* buffer = &data[0];
+size_t max_offset = size - 0x1000;
+for (size_t i = 0; i < max_offset; ++i) {
+if (validate_dos_header(buffer + i)) {
+uint32_t pe_offset = *reinterpret_cast<const uint32_t *>(buffer + i + 0x3c);
+if (i + pe_offset + 4 < size) {
+if (validate_pe_signature(buffer + i + pe_offset, size - i - pe_offset)) {
+pe_offsets.push_back(i + pe_offset);
+}
+}
+}
+}
 }
 
 // Extract a single PE file from the memory dump
@@ -115,7 +115,7 @@ void extract_pe(const std::vector<char>& data, uint32_t offset, const std::strin
 const char* buffer = &data[0];
 // Get the size of the PE file
 uint32_t size_of_image = *reinterpret_cast<const uint32_t *>(buffer + offset + 0x50);
- // Write the PE file to disk
+// Write the PE file to disk
 std::string output_file = output_dir + "/pe_" + std::to_string(offset) + ".exe";
 std::ofstream file(output_file, std::ios::binary);
 file.write(buffer + offset, size_of_image);
@@ -123,7 +123,7 @@ file.write(buffer + offset, size_of_image);
 // Extract all PE files from the memory dump using threadpooling
 void extract_pe_files(const std::vector<char>& data, const std::vector<uint32_t>& pe_offsets, const std::string& output_dir, size_t num_threads) {
 ThreadPool thread_pool(num_threads);
-    for (auto offset : pe_offsets) {
+for (auto offset : pe_offsets) {
     thread_pool.enqueue(extract_pe, data, offset, output_dir);
 }
 }
@@ -132,7 +132,7 @@ if (argc != 4) {
 std::cerr << "Usage: " << argv[0] << " <input file> <output dir> <num threads>" << std::endl;
 return 1;
 }
-    std::string input_file = argv[1];
+std::string input_file = argv[1];
 std::string output_dir = argv[2];
 size_t num_threads = std::stoi(argv[3]);
 
