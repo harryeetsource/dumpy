@@ -1,1 +1,1 @@
-g++ -std=c++17 main.cpp -o program.exe -lstdc++fs -lstdc++ -static-libgcc -static-libstdc++
+g++ -std=c++17 main.cpp -o program.exe -lstdc++fs -lstdc++ -static-libgcc -static-libstdc++ -static
