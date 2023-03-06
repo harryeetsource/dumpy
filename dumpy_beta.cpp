@@ -1,161 +1,148 @@
-#include <fstream>
 #include <iostream>
-#include <string>
+
+#include <fstream>
+
 #include <vector>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <queue>
-#include <algorithm>
-#include <functional>
-#include <cstdint>
+
+#include <string>
+
+#include <experimental/filesystem>
+
 #include <cstring>
 
 #include <windows.h>
 
-// Threadpool implementation
-class ThreadPool {
-public:
-    explicit ThreadPool(size_t num_threads) {
-        for (size_t i = 0; i < num_threads; ++i) {
-            threads.emplace_back([this] {
-                for (;;) {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock<std::mutex> lock{mutex};
-                        condition.wait(lock, [this] { return stop || !tasks.empty(); });
-                        if (stop && tasks.empty()) return;
-                        task = std::move(tasks.front());
-                        tasks.pop();
-                    }
-                    task();
-                }
-            });
+namespace fs = std::experimental::filesystem;
+
+void extract_executables(const std::string & input_path,
+  const std::string & output_path) {
+  std::ifstream input_file(input_path, std::ios::binary);
+  if (!input_file) {
+    std::cerr << "Failed to open input file: " << input_path << std::endl;
+    return;
+  }
+
+  std::vector < char > buffer(std::istreambuf_iterator < char > (input_file), {});
+  input_file.close();
+
+  const char * data = buffer.data();
+  const size_t size = buffer.size();
+
+  size_t pos = 0;
+  int count = 0;
+  while (pos < size) {
+    // Search for DOS header.
+    const char * dos_header = & data[pos];
+    const char * dos_magic = "MZ";
+    const size_t dos_magic_size = 2; // DOS header is always 2 bytes long.
+    if (memcmp(dos_header, dos_magic, dos_magic_size) == 0) {
+      // Check for valid DOS executable format.
+      const char * pe_header = & data[pos + 0x3C];
+      const uint32_t pe_offset = * reinterpret_cast <
+        const uint32_t * > (pe_header);
+      const char * pe_signature = & data[pos + pe_offset];
+      const char * pe_magic = "PE\0\0";
+      const size_t pe_magic_size = 4; // PE signature is always 4 bytes long.
+      if (pe_offset != 0 && pos + pe_offset + pe_magic_size <= size &&
+        memcmp(pe_signature, pe_magic, pe_magic_size) == 0) {
+        // Check for Win32 or Win64 PE format.
+        const uint16_t pe_machine = * reinterpret_cast <
+          const uint16_t * > ( & data[pos + pe_offset + 0x4]);
+        if (pe_machine == 0x14c) { // Win32
+          uint32_t pe_size = * reinterpret_cast <
+            const uint32_t * > ( & data[pos + pe_offset + 0x50]);
+          if (pe_size != 0 && pos + pe_offset + pe_size <= size && pe_size <= 100000000) {
+            // Extract Win32 PE file data.
+            const char * file_data = & data[pos];
+            std::string filename = output_path + std::to_string(count) + ".exe";
+            std::ofstream output_file(filename, std::ios::binary);
+            if (output_file) {
+              output_file.write(file_data, pe_size + pe_offset);
+
+              // Verify that the file has a valid ending and no MZ header is appended to the end.
+              uint16_t last_two_bytes = * reinterpret_cast <
+                const uint16_t * > ( & data[pos + pe_offset + pe_size - 2]);
+              if (last_two_bytes != 0 || memcmp( & data[pos + pe_offset + pe_size - dos_magic_size], dos_magic, dos_magic_size) == 0) {
+                std::cerr << "Invalid ending or MZ header appended to the end of the file: " << filename << std::endl;
+                output_file.close();
+                std::remove(filename.c_str());
+                pos += pe_offset + 1; // skip to next possible DOS header
+                continue;
+              }
+
+              output_file.close();
+              std::cout << "Extracted file: " << filename << std::endl;
+            } else {
+              std::cerr << "Failed to open output file: " << filename << std::endl;
+            }
+            count++;
+            pos += pe_size + pe_offset;
+          } else {
+            std::cerr << "Invalid size or size too large: " << pe_size << std::endl;
+            pos += pe_offset + 1; // skip to next possible DOS header
+            continue;
+          }
+        } else if (pe_machine == 0x8664) { // Win64
+         uint32_t pe_size = *reinterpret_cast<const uint32_t*>(&data[pos + pe_offset + 0x50]);
+
+          if (pe_size != 0 && pos + pe_offset + pe_size <= size && pe_size <= 100000000) {
+            // Extract Win64 PE file data.
+            const char * file_data = & data[pos];
+            std::string filename = output_path + std::to_string(count) + ".exe";
+            std::ofstream output_file(filename, std::ios::binary);
+            if (output_file) {
+              output_file.write(file_data, pe_size + pe_offset);
+              // Verify that the file has a valid ending and no MZ header is appended to the end.
+              uint16_t last_two_bytes = * reinterpret_cast <
+                const uint16_t * > ( & data[pos + pe_offset + pe_size - 2]);
+              if (last_two_bytes != 0 || memcmp( & data[pos + pe_offset + pe_size - dos_magic_size], dos_magic, dos_magic_size) == 0) {
+                std::cerr << "Invalid ending or MZ header appended to the end of the file: " << filename << std::endl;
+                output_file.close();
+                std::remove(filename.c_str());
+                pos += pe_offset + 1; // skip to next possible DOS header
+                continue;
+              }
+
+              output_file.close();
+              std::cout << "Extracted file: " << filename << std::endl;
+            } else {
+              std::cerr << "Failed to open output file: " << filename << std::endl;
+            }
+            count++;
+            pos += pe_size + pe_offset;
+          } else {
+            std::cerr << "Invalid size or size too large: " << pe_size << std::endl;
+            pos += pe_offset + 1; // skip to next possible DOS header
+            continue;
+          }
+        } else {
+          std::cerr << "Invalid machine type: " << pe_machine << std::endl;
+          pos += pe_offset + 1; // skip to next possible DOS header
+          continue;
         }
+      } else {
+        std::cerr << "Invalid offset or PE signature not found" << std::endl;
+        pos += dos_magic_size; // skip past the DOS header
+        continue;
+      }
+    } else {
+      pos += 1; // move to next byte
     }
-
-    ~ThreadPool() {
-        {
-            std::unique_lock<std::mutex> lock{mutex};
-            stop = true;
-        }
-        condition.notify_all();
-        for (auto &thread : threads) {
-            thread.join();
-        }
-    }
-
-    template<typename F, typename... Args>
-    void enqueue(F &&f, Args &&... args) {
-        {
-            std::unique_lock<std::mutex> lock{mutex};
-            tasks.emplace([f = std::forward<F>(f), args = std::make_tuple(std::forward<Args>(args)...)]() {
-                std::apply(f, args);
-            });
-        }
-        condition.notify_one();
-    }
-
-private:
-    std::vector<std::thread> threads;
-    std::queue<std::function<void()>> tasks;
-    std::mutex mutex;
-    std::condition_variable condition;
-    bool stop = false;
-};
-
-// Check for valid DOS header
-bool validate_dos_header(const char *buffer) {
-    // Check for valid MZ signature
-    if (memcmp(buffer, "MZ", 2) != 0) {
-        return false;
-    }
-
-    // Check for valid PE offset
-    uint32_t pe_offset = *reinterpret_cast<const uint32_t *>(buffer + 0x3c);
-    if (pe_offset >= 0x1000) {
-        return false;
-    }
-
-    return true;
+  }
 }
-
-// Check for valid PE signature
-bool validate_pe_signature(const char *buffer, uint32_t size) {
-    if (size < 0x1000) {
-        return false;
-    }
-
-    // Check for valid PE signature
-    if (memcmp(buffer + *reinterpret_cast<const uint32_t *>(buffer + 0x3c), "PE\0\0", 4) != 0) {
-        return false;
-    }
-
-    return true;
-}
-
-// Find the offsets of all PE files in the memory dump
-void find_pe_offsets(const std::vector<char>& data, size_t size, std::vector<uint32_t>& pe_offsets) {
-const char* buffer = &data[0];
-size_t max_offset = size - 0x1000;
-for (size_t i = 0; i < max_offset; ++i) {
-if (validate_dos_header(buffer + i)) {
-uint32_t pe_offset = *reinterpret_cast<const uint32_t *>(buffer + i + 0x3c);
-if (i + pe_offset + 4 < size) {
-if (validate_pe_signature(buffer + i + pe_offset, size - i - pe_offset)) {
-pe_offsets.push_back(i + pe_offset);
-}
-}
-}
-}
-}
-
-// Extract a single PE file from the memory dump
-void extract_pe(const std::vector<char>& data, uint32_t offset, const std::string& output_dir) {
-const char* buffer = &data[0];
-// Get the size of the PE file
-uint32_t size_of_image = *reinterpret_cast<const uint32_t *>(buffer + offset + 0x50);
-// Write the PE file to disk
-std::string output_file = output_dir + "/pe_" + std::to_string(offset) + ".exe";
-std::ofstream file(output_file, std::ios::binary);
-file.write(buffer + offset, size_of_image);
-}
-// Extract all PE files from the memory dump using threadpooling
-void extract_pe_files(const std::vector<char>& data, const std::vector<uint32_t>& pe_offsets, const std::string& output_dir, size_t num_threads) {
-ThreadPool thread_pool(num_threads);
-for (auto offset : pe_offsets) {
-    thread_pool.enqueue(extract_pe, data, offset, output_dir);
-}
-}
-int main(int argc, char** argv) {
-if (argc != 4) {
-std::cerr << "Usage: " << argv[0] << " <input file> <output dir> <num threads>" << std::endl;
-return 1;
-}
-std::string input_file = argv[1];
-std::string output_dir = argv[2];
-size_t num_threads = std::stoi(argv[3]);
-
-// Read the memory dump file into a vector
-std::vector<char> data;
-std::ifstream file(input_file, std::ios::binary | std::ios::ate);
-if (file.is_open()) {
-    size_t size = file.tellg();
-    data.resize(size);
-    file.seekg(0, std::ios::beg);
-    file.read(data.data(), size);
-    file.close();
-} else {
-    std::cerr << "Error: could not open file: " << input_file << std::endl;
+int main(int argc, char ** argv) {
+  if (argc != 3) {
+    std::cerr << "Usage: " << argv[0] << " input_file output_dir" << std::endl;
     return 1;
-}
+  }
 
-// Find the offsets of all PE files in the memory dump
-std::vector<uint32_t> pe_offsets;
-find_pe_offsets(data, data.size(), pe_offsets);
+  const std::string input_path = argv[1];
+  const std::string output_path = argv[2];
+  if (!fs::exists(output_path)) {
+    fs::create_directory(output_path);
+  }
 
-// Extract all PE files from the memory dump
-extract_pe_files(data, pe_offsets, output_dir, num_threads);
+  extract_executables(input_path, output_path);
 
-return 0;
+  return 0;
 }
