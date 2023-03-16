@@ -30,12 +30,12 @@ void extract_executables(const std::string& input_path, const std::string& outpu
     std::vector<std::thread> threads;
 
     std::unordered_set<std::string> headers;
-
-    while (pos < size) {
-        const char* dos_header = &data[pos];
-        const char* dos_magic = "MZ";
-        const size_t dos_magic_size = 2;
-        if (memcmp(dos_header, dos_magic, dos_magic_size) == 0) {
+    const char* dos_magic = "MZ";
+    const size_t dos_magic_size = 2;
+    while (pos < size - dos_magic_size) { // Change the condition to avoid reading past the buffer
+    const char* dos_header = &data[pos];
+    
+    if (memcmp(dos_header, dos_magic, dos_magic_size) == 0) {
             if (pos != last_mz_pos) { // check if this is a new file
                 last_mz_pos = pos; // update last MZ header position
                 const char* pe_header = &data[pos + 0x3C];
