@@ -55,6 +55,22 @@ type PESectionHeader struct {
 	Characteristics      uint32
 }
 
+func findPEOffset(data []byte, pos int) int {
+	minPeOffset := 0x40
+	maxPeOffset := 0x200
+
+	for offset := minPeOffset; offset <= maxPeOffset; offset++ {
+		if pos+offset+4 > len(data) {
+			break
+		}
+		if bytes.Equal(data[pos+offset:pos+offset+4], []byte{0x50, 0x45, 0x00, 0x00}) {
+			return offset
+		}
+	}
+
+	return -1
+}
+
 func findMZHeaders(buffer []byte) []int {
 	dosMagic := []byte("MZ")
 	mzPositions := []int{}
@@ -79,32 +95,34 @@ func extractExecutables(inputPath, outputPath string) {
 	count := 0
 	headers := make(map[string]bool)
 
-	for _, pos32 := range mzOffsets {
-		pos := int(pos32)
-		peOffset := binary.LittleEndian.Uint32(data[pos+0x3C : pos+0x3C+4])
+	for _, pos := range mzOffsets {
+		peHeaderAddr := int(binary.LittleEndian.Uint32(data[pos+0x3C : pos+0x3C+4]))
+		peHeaderPos := pos + peHeaderAddr
 
-		if peOffset != 0 && pos+int(peOffset)+4 <= len(data) && bytes.Equal(data[pos+int(peOffset):pos+int(peOffset)+4], []byte{0x50, 0x45, 0x00, 0x00}) {
-			peMachine := binary.LittleEndian.Uint16(data[pos+int(peOffset)+4 : pos+int(peOffset)+4+2])
+		if peHeaderAddr <= 0 || peHeaderPos >= len(data) || peHeaderPos+4 > len(data) {
+			continue
+		}
+
+		if bytes.Equal(data[peHeaderPos:peHeaderPos+4], []byte{0x50, 0x45, 0x00, 0x00}) {
+			peMachine := binary.LittleEndian.Uint16(data[peHeaderPos+4 : peHeaderPos+4+2])
 
 			if peMachine == 0x14c || peMachine == 0x8664 {
-				peSize := binary.LittleEndian.Uint32(data[pos+int(peOffset)+0x50 : pos+int(peOffset)+0x50+4])
+				peSize := binary.LittleEndian.Uint32(data[peHeaderPos+0x50 : peHeaderPos+0x50+4])
 
-				if peSize != 0 && pos+int(peOffset)+int(peSize) <= len(data) && peSize <= 100000000 {
-					headerStr := string(data[pos+int(peOffset) : pos+int(peOffset)+min(1024, int(peSize))])
+				if peSize != 0 && peHeaderPos+int(peSize) <= len(data) && peSize <= 100000000 {
+					headerStr := string(data[peHeaderPos : peHeaderPos+min(1024, int(peSize))])
 
 					if _, found := headers[headerStr]; !found {
 						headers[headerStr] = true
 
-						if data[pos+int(peOffset)+int(peSize)-1] == 0x00 {
-							filename := fmt.Sprintf("%s%d.exe", outputPath, count)
-							count++
+						filename := fmt.Sprintf("%s%d.exe", outputPath, count)
+						count++
 
-							err = ioutil.WriteFile(filename, data[pos:pos+int(peOffset)+int(peSize)], 0644)
-							if err != nil {
-								log.Printf("Failed to write output file: %v", err)
-							} else {
-								fmt.Printf("Extracted file: %s\n", filename)
-							}
+						err = ioutil.WriteFile(filename, data[pos:peHeaderPos+int(peSize)], 0644)
+						if err != nil {
+							log.Printf("Failed to write output file: %v", err)
+						} else {
+							fmt.Printf("Extracted file: %s\n", filename)
 						}
 					}
 				}
