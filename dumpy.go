@@ -108,6 +108,7 @@ func extractExecutables(inputPath, outputPath string) {
 
 			if peMachine == 0x14c || peMachine == 0x8664 {
 				peSize := binary.LittleEndian.Uint32(data[peHeaderPos+0x50 : peHeaderPos+0x50+4])
+				fileAlignment := binary.LittleEndian.Uint32(data[peHeaderPos+0x3C : peHeaderPos+0x3C+4])
 
 				if peSize != 0 && peHeaderPos+int(peSize) <= len(data) && peSize <= 100000000 {
 					headerStr := string(data[peHeaderPos : peHeaderPos+min(1024, int(peSize))])
@@ -115,17 +116,17 @@ func extractExecutables(inputPath, outputPath string) {
 					if _, found := headers[headerStr]; !found {
 						headers[headerStr] = true
 
-						// Find the position of the 0x00 byte
-						extraSize := 0
-						for peHeaderPos+int(peSize)+extraSize < len(data) && data[peHeaderPos+int(peSize)+extraSize] != 0x00 {
-							extraSize++
+						padding := 0
+						if int(peSize)%int(fileAlignment) != 0 {
+							padding = int(fileAlignment) - int(peSize)%int(fileAlignment)
 						}
 
-						if peHeaderPos+int(peSize)+extraSize < len(data) {
+						extractedSize := int(peSize) + padding
+						if peHeaderPos+extractedSize <= len(data) {
 							filename := fmt.Sprintf("%s%d.exe", outputPath, count)
 							count++
 
-							err = ioutil.WriteFile(filename, data[pos:peHeaderPos+int(peSize)+extraSize], 0644)
+							err = ioutil.WriteFile(filename, data[pos:pos+extractedSize], 0644)
 							if err != nil {
 								log.Printf("Failed to write output file: %v", err)
 							} else {
