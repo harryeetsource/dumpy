@@ -115,14 +115,22 @@ func extractExecutables(inputPath, outputPath string) {
 					if _, found := headers[headerStr]; !found {
 						headers[headerStr] = true
 
-						filename := fmt.Sprintf("%s%d.exe", outputPath, count)
-						count++
+						// Find the position of the 0x00 byte
+						extraSize := 0
+						for peHeaderPos+int(peSize)+extraSize < len(data) && data[peHeaderPos+int(peSize)+extraSize] != 0x00 {
+							extraSize++
+						}
 
-						err = ioutil.WriteFile(filename, data[pos:peHeaderPos+int(peSize)], 0644)
-						if err != nil {
-							log.Printf("Failed to write output file: %v", err)
-						} else {
-							fmt.Printf("Extracted file: %s\n", filename)
+						if peHeaderPos+int(peSize)+extraSize < len(data) {
+							filename := fmt.Sprintf("%s%d.exe", outputPath, count)
+							count++
+
+							err = ioutil.WriteFile(filename, data[pos:peHeaderPos+int(peSize)+extraSize], 0644)
+							if err != nil {
+								log.Printf("Failed to write output file: %v", err)
+							} else {
+								fmt.Printf("Extracted file: %s\n", filename)
+							}
 						}
 					}
 				}
