@@ -117,7 +117,7 @@ func extractExecutables(inputPath, outputPath string) {
 						headers[headerStr] = true
 
 						padding := 0
-						if int(peSize)%int(fileAlignment) != 0 {
+						if fileAlignment != 0 && int(peSize)%int(fileAlignment) != 0 {
 							padding = int(fileAlignment) - int(peSize)%int(fileAlignment)
 						}
 
