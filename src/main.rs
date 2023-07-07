@@ -65,18 +65,21 @@ fn extract_executables(input_path: &str, output_path: &str) {
             if buffer[nt_header_pos..nt_header_pos+4] == [0x50, 0x45, 0x00, 0x00] { // "PE\0\0"
         let magic: u16 = unsafe { std::ptr::read(buffer[nt_header_pos+0x18..].as_ptr() as *const _) };
         if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC {
+            if nt_header_pos + size_of::<IMAGE_NT_HEADERS32>() > buffer.len() {
+                continue;
+            }
             let nt_headers: IMAGE_NT_HEADERS32 = unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
             let header_str = std::string::String::from_utf8_lossy(&buffer[pos..(pos + nt_headers.OptionalHeader.SizeOfHeaders as usize)]);
             write_file(&buffer, header_str, nt_headers.OptionalHeader.SizeOfImage as usize, nt_headers.OptionalHeader.FileAlignment as usize, pos, offset, output_path, &mut count, &mut headers);
-
-
         } else if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+            if nt_header_pos + size_of::<IMAGE_NT_HEADERS64>() > buffer.len() {
+                continue;
+            }
             let nt_headers: IMAGE_NT_HEADERS64 = unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
             let header_str = std::string::String::from_utf8_lossy(&buffer[pos..(pos + nt_headers.OptionalHeader.SizeOfHeaders as usize)]);
             write_file(&buffer, header_str, nt_headers.OptionalHeader.SizeOfImage as usize, nt_headers.OptionalHeader.FileAlignment as usize, pos, offset, output_path, &mut count, &mut headers);
-
-
         }
+        
     }
         }
 
