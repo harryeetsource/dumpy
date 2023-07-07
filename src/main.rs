@@ -60,27 +60,21 @@ fn extract_executables(input_path: &str, output_path: &str) {
             if nt_header_pos + size_of::<IMAGE_NT_HEADERS32>() > buffer.len() || nt_header_pos + size_of::<IMAGE_NT_HEADERS64>() > buffer.len() {
                 continue;
             }
-
+    
             // Determine architecture
             if buffer[nt_header_pos..nt_header_pos+4] == [0x50, 0x45, 0x00, 0x00] { // "PE\0\0"
-        let magic: u16 = unsafe { std::ptr::read(buffer[nt_header_pos+0x18..].as_ptr() as *const _) };
-        if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC {
-            if nt_header_pos + size_of::<IMAGE_NT_HEADERS32>() > buffer.len() {
-                continue;
-            }
-            let nt_headers: IMAGE_NT_HEADERS32 = unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
-            let header_str = std::string::String::from_utf8_lossy(&buffer[pos..(pos + nt_headers.OptionalHeader.SizeOfHeaders as usize)]);
-            write_file(&buffer, header_str, nt_headers.OptionalHeader.SizeOfImage as usize, nt_headers.OptionalHeader.FileAlignment as usize, pos, offset, output_path, &mut count, &mut headers);
-        } else if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
-            if nt_header_pos + size_of::<IMAGE_NT_HEADERS64>() > buffer.len() {
-                continue;
-            }
-            let nt_headers: IMAGE_NT_HEADERS64 = unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
-            let header_str = std::string::String::from_utf8_lossy(&buffer[pos..(pos + nt_headers.OptionalHeader.SizeOfHeaders as usize)]);
-            write_file(&buffer, header_str, nt_headers.OptionalHeader.SizeOfImage as usize, nt_headers.OptionalHeader.FileAlignment as usize, pos, offset, output_path, &mut count, &mut headers);
-        }
-        
+    let magic: u16 = unsafe { std::ptr::read(buffer[nt_header_pos+0x18..].as_ptr() as *const _) };
+    if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC {
+        let nt_headers: IMAGE_NT_HEADERS32 = unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
+        let header_str = std::string::String::from_utf8_lossy(&buffer[pos..(pos + nt_headers.OptionalHeader.SizeOfHeaders as usize)]);
+        write_file(&buffer, header_str, nt_headers.OptionalHeader.SizeOfImage as usize, nt_headers.OptionalHeader.FileAlignment as usize, pos, offset, output_path, &mut count, &mut headers);
+    } else if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+        let nt_headers: IMAGE_NT_HEADERS64 = unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
+        let header_str = std::string::String::from_utf8_lossy(&buffer[pos..(pos + nt_headers.OptionalHeader.SizeOfHeaders as usize)]);
+        write_file(&buffer, header_str, nt_headers.OptionalHeader.SizeOfImage as usize, nt_headers.OptionalHeader.FileAlignment as usize, pos, offset, output_path, &mut count, &mut headers);
     }
+}
+
         }
 
         offset += bytes_read;
@@ -92,22 +86,24 @@ fn extract_executables(input_path: &str, output_path: &str) {
         }
 
         // Remember part of the chunk to handle executables spread over two chunks
-        overlap = buffer[CHUNK_SIZE..].to_vec();
+        overlap = buffer[(buffer.len() - overlap.len())..].to_vec();
+
 
         // Seek backwards the size of the overlap so the next chunk will start at the right position
         file.seek(SeekFrom::Current(-(overlap.len() as i64))).unwrap();
     }
 }
 
-fn write_file(data: &[u8], header_str: std::borrow::Cow<str>, pe_size: usize, file_alignment: usize, pos: usize, offset: usize, output_path: &str, count: &mut u32, headers: &mut std::collections::HashSet<String>) {
+fn write_file(data: &[u8], header_str: std::borrow::Cow<str>, header_bytes: usize, file_alignment: usize, pos: usize, offset: usize, output_path: &str, count: &mut u32, headers: &mut std::collections::HashSet<String>) {
     if headers.insert(header_str.to_string()) {
-        let filename = format!("{}/{}_{}.exe", output_path, count, offset); // Include offset in filename
+        let filename = format!("{}/{}_{}.exe", output_path, count, offset);
         *count += 1;
 
-        let padding = if file_alignment == 0 { 0 } else { pe_size % file_alignment };
-        let end = pos + pe_size + padding;
-        
+        let padding = if file_alignment == 0 { 0 } else { header_bytes % file_alignment };
+        let end = pos + header_bytes + padding;
+
         if end > data.len() {
+            println!("File at offset {} is too large or corrupted. Skipping...", offset);
             return;
         }
 
@@ -116,6 +112,8 @@ fn write_file(data: &[u8], header_str: std::borrow::Cow<str>, pe_size: usize, fi
         println!("Extracted file: {}", filename);
     }
 }
+
+
 
 
 
