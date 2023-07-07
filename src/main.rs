@@ -66,11 +66,13 @@ fn extract_executables(input_path: &str, output_path: &str) {
     let magic: u16 = unsafe { std::ptr::read(buffer[nt_header_pos+0x18..].as_ptr() as *const _) };
     if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC {
         let nt_headers: IMAGE_NT_HEADERS32 = unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
+        
         let header_str = std::string::String::from_utf8_lossy(&buffer[pos..(pos + nt_headers.OptionalHeader.SizeOfHeaders as usize)]);
         write_file(&buffer, header_str, nt_headers.OptionalHeader.SizeOfImage as usize, nt_headers.OptionalHeader.FileAlignment as usize, pos, offset, output_path, &mut count, &mut headers);
     } else if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
         let nt_headers: IMAGE_NT_HEADERS64 = unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
-        let header_str = std::string::String::from_utf8_lossy(&buffer[pos..(pos + nt_headers.OptionalHeader.SizeOfHeaders as usize)]);
+        
+        let header_str = std::string::String::from_utf8_lossy(&buffer[pos..(pos + nt_headers.OptionalHeader.SizeOfImage as usize)]);
         write_file(&buffer, header_str, nt_headers.OptionalHeader.SizeOfImage as usize, nt_headers.OptionalHeader.FileAlignment as usize, pos, offset, output_path, &mut count, &mut headers);
     }
 }
@@ -86,11 +88,16 @@ fn extract_executables(input_path: &str, output_path: &str) {
         }
 
         // Remember part of the chunk to handle executables spread over two chunks
-        overlap = buffer[(buffer.len() - overlap.len())..].to_vec();
+let overlap_size = buffer.len().saturating_sub(CHUNK_SIZE);
+if overlap_size > 0 {
+    overlap = buffer[CHUNK_SIZE..].to_vec();
 
+    // Seek backwards the size of the overlap so the next chunk will start at the right position
+    file.seek(SeekFrom::Current(-(overlap.len() as i64))).unwrap();
+} else {
+    overlap.clear();
+}
 
-        // Seek backwards the size of the overlap so the next chunk will start at the right position
-        file.seek(SeekFrom::Current(-(overlap.len() as i64))).unwrap();
     }
 }
 
