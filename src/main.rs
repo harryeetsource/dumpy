@@ -1,12 +1,15 @@
 extern crate winapi;
-use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_OPTIONAL_HDR64_MAGIC};
+use core::mem::size_of;
+use std::fs;
 use std::fs::File;
 use std::io::Read;
-use std::io::Write;
-use std::fs;
-use std::io::SeekFrom;
 use std::io::Seek;
-use core::mem::size_of;
+use std::io::SeekFrom;
+use std::io::Write;
+use winapi::um::winnt::{
+    IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC,
+    IMAGE_NT_OPTIONAL_HDR64_MAGIC,
+};
 extern crate crypto_hash;
 use crypto_hash::{Algorithm, Hasher};
 use hex;
@@ -17,8 +20,8 @@ fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
     let dos_magic = b"MZ";
     let mut mz_positions = Vec::new();
 
-    for pos in 0..buffer.len()-dos_magic.len() {
-        if buffer[pos..pos+dos_magic.len()] == *dos_magic {
+    for pos in 0..buffer.len() - dos_magic.len() {
+        if buffer[pos..pos + dos_magic.len()] == *dos_magic {
             mz_positions.push(pos);
         }
     }
@@ -32,10 +35,8 @@ fn extract_executables(input_path: &str, output_path: &str) {
     let mut overlap = vec![0; 0];
 
     loop {
-        // Read data in chunks
-        let mut buffer = vec![0; CHUNK_SIZE + 0x200]; // Plus maximum possible header size
+        let mut buffer = vec![0; CHUNK_SIZE + 0x200];
 
-        // Keep track of how much data we actually read
         let bytes_read = file
             .read(&mut buffer[overlap.len()..])
             .expect("Failed to read data");
@@ -43,7 +44,6 @@ fn extract_executables(input_path: &str, output_path: &str) {
             break;
         }
 
-        // Prepend any overlapping data from the previous chunk
         buffer.splice(..overlap.len(), overlap.iter().cloned());
         buffer.truncate(bytes_read + overlap.len());
 
@@ -57,12 +57,16 @@ fn extract_executables(input_path: &str, output_path: &str) {
                 continue;
             }
 
-            // Read IMAGE_DOS_HEADER from buffer[pos..]
-            let dos_header: IMAGE_DOS_HEADER =
-                unsafe { std::ptr::read(buffer[pos..].as_ptr() as *const _) };
+            let dos_header: IMAGE_DOS_HEADER = match safe_read::<IMAGE_DOS_HEADER>(&buffer[pos..]) {
+                Some(header) => header,
+                None => {
+                    println!("Failed to read IMAGE_DOS_HEADER at position {}. Skipping...", pos);
+                    continue;
+                }
+            };
+            
 
             if dos_header.e_magic != 0x5a4d {
-                // "MZ"
                 continue;
             }
 
@@ -73,31 +77,41 @@ fn extract_executables(input_path: &str, output_path: &str) {
                 continue;
             }
 
-            // Determine architecture
             if buffer[nt_header_pos..nt_header_pos + 4] == [0x50, 0x45, 0x00, 0x00] {
-                // "PE\0\0"
-                let magic: u16 =
-                    unsafe { std::ptr::read(buffer[nt_header_pos + 0x18..].as_ptr() as *const _) };
+                let magic: u16 = match safe_read::<u16>(&buffer[nt_header_pos + 0x18..]) {
+                    Some(m) => m,
+                    None => {
+                        println!("Failed to read magic at position {}. Skipping...", nt_header_pos + 0x18);
+                        continue;
+                    }
+                };
+                
                 if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC {
-                    let nt_headers: IMAGE_NT_HEADERS32 =
-                        unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
-
+                    let nt_headers: IMAGE_NT_HEADERS32 = match safe_read::<IMAGE_NT_HEADERS32>(&buffer[nt_header_pos..]) {
+                        Some(header) => header,
+                        None => {
+                            println!("Failed to read IMAGE_NT_HEADERS32 at position {}. Skipping...", nt_header_pos);
+                            continue;
+                        }
+                    };
+                    
                     let header_end = pos + nt_headers.OptionalHeader.SizeOfHeaders as usize;
-                    if header_end > buffer.len() {
-                        // Header size exceeds buffer length, create a new buffer for this executable
-                        let mut new_buffer = buffer[pos..header_end].to_vec();
-                        new_buffer.resize(
-                            nt_headers.OptionalHeader.SizeOfImage as usize,
-                            0,
-                        );
 
-                        let remaining_data = &buffer[header_end..];
+                    if header_end > buffer.len() {
+                        let upper_bound = std::cmp::min(buffer.len(), pos + nt_headers.OptionalHeader.SizeOfImage as usize);
+                        let mut new_buffer = vec![0; nt_headers.OptionalHeader.SizeOfImage as usize];
+                        new_buffer.copy_from_slice(&buffer[pos..upper_bound]);
+
+                        let remaining_upper_bound = std::cmp::min(buffer.len(), header_end);
+                        let remaining_data = &buffer[remaining_upper_bound..];
+
                         new_buffer.extend_from_slice(remaining_data);
 
                         buffer = new_buffer;
                     }
 
-                    let header_str = std::string::String::from_utf8_lossy(&buffer[pos..header_end]);
+                    let header_str_bound = std::cmp::min(buffer.len(), header_end);
+                    let header_str = std::string::String::from_utf8_lossy(&buffer[pos..header_str_bound]);
 
                     let header_str_owned = header_str.to_string();
                     write_file(
@@ -112,26 +126,37 @@ fn extract_executables(input_path: &str, output_path: &str) {
                         &mut headers,
                     );
                 } else if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
-                    let nt_headers: IMAGE_NT_HEADERS64 =
-                        unsafe { std::ptr::read(buffer[nt_header_pos..].as_ptr() as *const _) };
-
+                    let nt_headers: IMAGE_NT_HEADERS64 = match safe_read::<IMAGE_NT_HEADERS64>(&buffer[nt_header_pos..]) {
+                        Some(header) => header,
+                        None => {
+                            println!("Failed to read IMAGE_NT_HEADERS64 at position {}. Skipping...", nt_header_pos);
+                            continue;
+                        }
+                    };
                     let header_end = pos + nt_headers.OptionalHeader.SizeOfHeaders as usize;
+
                     if header_end > buffer.len() {
-                        // Header size exceeds buffer length, create a new buffer for this executable
-                        let mut new_buffer = buffer[pos..pos + header_end - pos].to_vec();
+                        let upper_bound = std::cmp::min(buffer.len(), pos + nt_headers.OptionalHeader.SizeOfImage as usize);
+                        let mut new_buffer = vec![0; nt_headers.OptionalHeader.SizeOfImage as usize];
+                        new_buffer.copy_from_slice(&buffer[pos..upper_bound]);
 
-                        new_buffer.resize(
-                            nt_headers.OptionalHeader.SizeOfImage as usize,
-                            0,
-                        );
+                        let remaining_upper_bound = std::cmp::min(buffer.len(), header_end);
+                        let remaining_data = &buffer[remaining_upper_bound..];
 
-                        let remaining_data = &buffer[header_end..];
                         new_buffer.extend_from_slice(remaining_data);
 
                         buffer = new_buffer;
                     }
 
-                    let header_str = std::string::String::from_utf8_lossy(&buffer[pos..header_end]);
+                    let header_str_bound = std::cmp::min(buffer.len(), header_end);
+                    if pos >= header_str_bound {
+                        println!("Invalid string range. Skipping...");
+                        continue;
+                    }
+                    
+                
+                    
+                    let header_str = std::string::String::from_utf8_lossy(&buffer[pos..header_str_bound]);
 
                     let header_str_owned = header_str.to_string();
                     write_file(
@@ -160,27 +185,32 @@ fn extract_executables(input_path: &str, output_path: &str) {
             );
         }
 
-        // Remember part of the chunk to handle executables spread over two chunks
         let overlap_size = buffer.len().saturating_sub(CHUNK_SIZE);
         if overlap_size > 0 {
             overlap = buffer[CHUNK_SIZE..].to_vec();
 
-            // Seek backwards the size of the overlap so the next chunk will start at the right position
-            file.seek(SeekFrom::Current(-(overlap.len() as i64))).unwrap();
+            file.seek(SeekFrom::Current(-(overlap.len() as i64)))
+                .unwrap();
         } else {
             overlap.clear();
         }
     }
 }
-
-
-
-
+fn safe_read<T>(buffer: &[u8]) -> Option<T> {
+    if buffer.len() < std::mem::size_of::<T>() {
+        return None;
+    }
+    let mut value: T = unsafe { std::mem::zeroed() };
+    unsafe {
+        std::ptr::copy_nonoverlapping(buffer.as_ptr(), &mut value as *mut T as *mut u8, std::mem::size_of::<T>());
+    }
+    Some(value)
+}
 
 
 fn write_file(
     data: &mut Vec<u8>,
-    header_str: Cow<str>,
+    _header_str: Cow<str>,
     header_bytes: usize,
     file_alignment: usize,
     pos: usize,
@@ -214,28 +244,27 @@ fn write_file(
             header_bytes % file_alignment
         };
         let end = pos + header_bytes + padding;
+
         if end > data.len() {
-            println!("File at offset {} is too large or corrupted. Skipping...", offset);
+            println!(
+                "File at offset {} is too large or corrupted. Skipping...",
+                offset
+            );
             return;
         }
 
         let mut file = File::create(&filename).expect("Failed to create file");
-        file.write_all(&data[pos..end]).expect("Failed to write data");
+        file.write_all(&data[pos..end])
+            .expect("Failed to write data");
 
         println!("Extracted file: {}", filename);
     } else {
-        println!("Duplicate executable with header hash {} skipped", header_hash);
+        println!(
+            "Duplicate executable with header hash {} skipped",
+            header_hash
+        );
     }
 }
-
-
-
-
-
-
-
-
-
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
