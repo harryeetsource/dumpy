@@ -40,9 +40,14 @@ fn extract_executables(input_path: &str, output_path: &str) {
         let bytes_read = file
             .read(&mut buffer[overlap.len()..])
             .expect("Failed to read data");
-        if bytes_read == 0 {
+
+        // Check if there are no more bytes to read
+        if bytes_read == 0 && overlap.is_empty() {
             break;
         }
+
+        buffer.splice(..overlap.len(), overlap.iter().cloned());
+        buffer.truncate(bytes_read + overlap.len());
 
         buffer.splice(..overlap.len(), overlap.iter().cloned());
         let effective_len = bytes_read + overlap.len(); // We store the effective length here before potentially enlarging the buffer
@@ -233,12 +238,21 @@ fn extract_executables(input_path: &str, output_path: &str) {
             );
         }
 
-        let overlap_size = buffer.len().saturating_sub(CHUNK_SIZE);
+        // Only set overlap if we actually read some bytes
+        let overlap_size = if bytes_read > 0 {
+            buffer.len().saturating_sub(CHUNK_SIZE)
+        } else {
+            0
+        };
+        
         if overlap_size > 0 {
             overlap = buffer[CHUNK_SIZE..].to_vec();
 
-            file.seek(SeekFrom::Current(-(overlap.len() as i64)))
-                .unwrap();
+            // If no new bytes were read, don't seek backwards in the file
+            if bytes_read > 0 {
+                file.seek(SeekFrom::Current(-(overlap.len() as i64)))
+                    .unwrap();
+            }
         } else {
             overlap.clear();
         }
