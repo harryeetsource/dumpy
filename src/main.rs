@@ -1,5 +1,9 @@
-extern crate winapi;
 use core::mem::size_of;
+use crypto_hash::{Algorithm, Hasher};
+use hex;
+use log::LevelFilter;
+use simplelog::*;
+use std::borrow::Cow;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -10,10 +14,6 @@ use winapi::um::winnt::{
     IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC,
     IMAGE_NT_OPTIONAL_HDR64_MAGIC,
 };
-extern crate crypto_hash;
-use crypto_hash::{Algorithm, Hasher};
-use hex;
-use std::borrow::Cow;
 const CHUNK_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
 fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
@@ -45,29 +45,33 @@ fn extract_executables(input_path: &str, output_path: &str) {
         }
 
         buffer.splice(..overlap.len(), overlap.iter().cloned());
-        buffer.truncate(bytes_read + overlap.len());
-
-        let mz_offsets = find_mz_headers(&buffer);
-
+        let effective_len = bytes_read + overlap.len(); // We store the effective length here before potentially enlarging the buffer
+        let mz_offsets = find_mz_headers(&buffer[..effective_len]); // Search only within the effective length
+        log::debug!("Found {} MZ headers.", mz_offsets.len());
         let mut count = 0;
         let mut headers = std::collections::HashSet::new();
 
         for pos in mz_offsets {
             if pos + size_of::<IMAGE_DOS_HEADER>() > buffer.len() {
+                log::warn!(
+                    "Offset {} exceeds buffer size at absolute offset {}. Skipping...",
+                    pos,
+                    offset + pos
+                );
                 continue;
             }
-    
-            let (dos_header, valid) = safe_read::<IMAGE_DOS_HEADER>(&buffer[pos..]);
+        
+            let (dos_header, valid) = safe_read::<IMAGE_DOS_HEADER>(&buffer[pos..pos + size_of::<IMAGE_DOS_HEADER>()]);
             if !valid {
-                println!("Warning: Failed to read IMAGE_DOS_HEADER at position {}. It may be corrupted.", pos);
+                log::warn!("Warning: Failed to read IMAGE_DOS_HEADER at position {} (absolute position {}). It may be corrupted.", pos, offset + pos);
                 continue;
             }
-    
+
             let dos_header = match dos_header {
                 Some(header) => header,
                 None => continue,
             };
-            
+
             if dos_header.e_magic != 0x5a4d {
                 continue;
             }
@@ -82,7 +86,10 @@ fn extract_executables(input_path: &str, output_path: &str) {
             if buffer[nt_header_pos..nt_header_pos + 4] == [0x50, 0x45, 0x00, 0x00] {
                 let (magic_option, valid_magic) = safe_read::<u16>(&buffer[nt_header_pos + 0x18..]);
                 if !valid_magic {
-                    println!("Failed to read magic at position {}. Skipping...", nt_header_pos + 0x18);
+                    log::warn!(
+                        "Failed to read magic at position {}. Skipping...",
+                        nt_header_pos + 0x18
+                    );
                     continue;
                 }
 
@@ -90,28 +97,32 @@ fn extract_executables(input_path: &str, output_path: &str) {
                     Some(m) => m,
                     None => continue,
                 };
-                
+
                 if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC {
-                    let (nt_headers_option, valid_nt_header) = safe_read::<IMAGE_NT_HEADERS32>(&buffer[nt_header_pos..]);
+                    let (nt_headers_option, valid_nt_header) =
+                        safe_read::<IMAGE_NT_HEADERS32>(&buffer[nt_header_pos..]);
                     if !valid_nt_header {
-                        println!("Warning: Failed to read IMAGE_NT_HEADERS32 at position {}. It may be corrupted.", nt_header_pos);
+                        log::warn!("Warning: Failed to read IMAGE_NT_HEADERS32 at position {} (absolute position {}). It may be corrupted.", nt_header_pos, offset + nt_header_pos);
                         continue;
                     }
-                    
+
                     let nt_headers = match nt_headers_option {
                         Some(header) => header,
                         None => continue,
                     };
-                    
+
                     let header_end = pos + nt_headers.OptionalHeader.SizeOfHeaders as usize;
 
                     if header_end < pos {
                         println!("Invalid header end. Skipping...");
                         continue;
                     }
-                    
+
                     if header_end > buffer.len() {
-                        let upper_bound = std::cmp::min(buffer.len(), pos + nt_headers.OptionalHeader.SizeOfImage as usize);
+                        let upper_bound = std::cmp::min(
+                            buffer.len(),
+                            pos + nt_headers.OptionalHeader.SizeOfImage as usize,
+                        );
                         let mut new_buffer = vec![0; upper_bound - pos];
                         new_buffer.copy_from_slice(&buffer[pos..upper_bound]);
 
@@ -125,39 +136,41 @@ fn extract_executables(input_path: &str, output_path: &str) {
 
                     let header_str_bound = std::cmp::min(buffer.len(), header_end);
                     if pos >= header_str_bound {
-                        println!("Invalid string range. Skipping...");
+                        log::warn!("Invalid string range. Skipping...");
                         continue;
                     }
-                    
-                    let header_str = std::string::String::from_utf8_lossy(&buffer[pos..header_str_bound]);
+
+                    let header_str =
+                        std::string::String::from_utf8_lossy(&buffer[pos..header_str_bound]);
 
                     let header_str_owned = header_str.to_string();
                     let valid = valid && valid_nt_header; // Both the DOS header and NT header must be valid for the file to be valid
 
-    write_file(
-        &mut buffer,
-        Cow::Borrowed(&header_str_owned),
-        nt_headers.OptionalHeader.SizeOfImage as usize,
-        nt_headers.OptionalHeader.FileAlignment as usize,
-        valid,  // Propagate the validity flag
-        pos,
-        offset + pos,
-        output_path,
-        &mut count,
-        &mut headers,
-    );
-  } else if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
-                    let (nt_headers_option, valid_nt_header) = safe_read::<IMAGE_NT_HEADERS64>(&buffer[nt_header_pos..]);
+                    write_file(
+                        &mut buffer,
+                        Cow::Borrowed(&header_str_owned),
+                        nt_headers.OptionalHeader.SizeOfImage as usize,
+                        nt_headers.OptionalHeader.FileAlignment as usize,
+                        valid, // Propagate the validity flag
+                        pos,
+                        offset + pos,
+                        output_path,
+                        &mut count,
+                        &mut headers,
+                    );
+                } else if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC {
+                    let (nt_headers_option, valid_nt_header) =
+                        safe_read::<IMAGE_NT_HEADERS64>(&buffer[nt_header_pos..]);
                     if !valid_nt_header {
-                        println!("Warning: Failed to read IMAGE_NT_HEADERS64 at position {}. It may be corrupted.", nt_header_pos);
+                        log::warn!("Warning: Failed to read IMAGE_NT_HEADERS64 at position {} (absolute position {}). It may be corrupted.", nt_header_pos, offset + nt_header_pos);
                         continue;
                     }
-                    
+
                     let nt_headers = match nt_headers_option {
                         Some(header) => header,
                         None => continue,
                     };
-                    
+
                     let header_end = pos + nt_headers.OptionalHeader.SizeOfHeaders as usize;
 
                     if header_end < pos {
@@ -166,7 +179,10 @@ fn extract_executables(input_path: &str, output_path: &str) {
                     }
 
                     if header_end > buffer.len() {
-                        let upper_bound = std::cmp::min(buffer.len(), pos + nt_headers.OptionalHeader.SizeOfImage as usize);
+                        let upper_bound = std::cmp::min(
+                            buffer.len(),
+                            pos + nt_headers.OptionalHeader.SizeOfImage as usize,
+                        );
                         let mut new_buffer = vec![0; upper_bound - pos];
                         new_buffer.copy_from_slice(&buffer[pos..upper_bound]);
 
@@ -180,28 +196,29 @@ fn extract_executables(input_path: &str, output_path: &str) {
 
                     let header_str_bound = std::cmp::min(buffer.len(), header_end);
                     if pos >= header_str_bound {
-                        println!("Invalid string range. Skipping...");
+                        log::warn!("Invalid string range at position {} (absolute position {}). Skipping...", pos, offset + pos);
                         continue;
                     }
 
-                    let header_str = std::string::String::from_utf8_lossy(&buffer[pos..header_str_bound]);
+                    let header_str =
+                        std::string::String::from_utf8_lossy(&buffer[pos..header_str_bound]);
 
                     let header_str_owned = header_str.to_string();
                     let valid = valid && valid_nt_header; // Both the DOS header and NT header must be valid for the file to be valid
 
-    write_file(
-        &mut buffer,
-        Cow::Borrowed(&header_str_owned),
-        nt_headers.OptionalHeader.SizeOfImage as usize,
-        nt_headers.OptionalHeader.FileAlignment as usize,
-        valid,  // Propagate the validity flag
-        pos,
-        offset + pos,
-        output_path,
-        &mut count,
-        &mut headers,
-    );
-}
+                    write_file(
+                        &mut buffer,
+                        Cow::Borrowed(&header_str_owned),
+                        nt_headers.OptionalHeader.SizeOfImage as usize,
+                        nt_headers.OptionalHeader.FileAlignment as usize,
+                        valid, // Propagate the validity flag
+                        pos,
+                        offset + pos,
+                        output_path,
+                        &mut count,
+                        &mut headers,
+                    );
+                }
             }
         }
 
@@ -234,11 +251,14 @@ fn safe_read<T>(buffer: &[u8]) -> (Option<T>, bool) {
     }
     let mut value: T = unsafe { std::mem::zeroed() };
     unsafe {
-        std::ptr::copy_nonoverlapping(buffer.as_ptr(), &mut value as *mut T as *mut u8, std::mem::size_of::<T>());
+        std::ptr::copy_nonoverlapping(
+            buffer.as_ptr(),
+            &mut value as *mut T as *mut u8,
+            std::mem::size_of::<T>(),
+        );
     }
     (Some(value), true)
 }
-
 
 fn write_file(
     data: &mut Vec<u8>,
@@ -303,7 +323,6 @@ fn write_file(
     }
 }
 
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -328,6 +347,10 @@ fn main() {
     } else {
         fs::create_dir_all(output_path).expect("Failed to create output directory");
     }
+    let log_config = ConfigBuilder::new().set_time_to_local(true).build();
 
+    let log_file = File::create("app.log").unwrap();
+
+    WriteLogger::init(LevelFilter::Info, log_config, log_file).unwrap();
     extract_executables(input_path, output_path);
 }
