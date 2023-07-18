@@ -14,6 +14,9 @@ use winapi::um::winnt::{
     IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC,
     IMAGE_NT_OPTIONAL_HDR64_MAGIC,
 };
+use std::collections::HashSet;
+use colored::*;
+use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 const CHUNK_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
 fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
@@ -49,12 +52,11 @@ fn extract_executables(input_path: &str, output_path: &str) {
         buffer.splice(..overlap.len(), overlap.iter().cloned());
         buffer.truncate(bytes_read + overlap.len());
 
-        buffer.splice(..overlap.len(), overlap.iter().cloned());
         let effective_len = bytes_read + overlap.len(); // We store the effective length here before potentially enlarging the buffer
         let mz_offsets = find_mz_headers(&buffer[..effective_len]); // Search only within the effective length
         log::debug!("Found {} MZ headers.", mz_offsets.len());
         let mut count = 0;
-        let mut headers = std::collections::HashSet::new();
+        let mut headers = HashSet::new();
 
         for pos in mz_offsets {
             if pos + size_of::<IMAGE_DOS_HEADER>() > buffer.len() {
@@ -83,10 +85,62 @@ fn extract_executables(input_path: &str, output_path: &str) {
 
             let nt_header_pos = pos + dos_header.e_lfanew as usize;
             if nt_header_pos + size_of::<IMAGE_NT_HEADERS32>() > buffer.len()
-                || nt_header_pos + size_of::<IMAGE_NT_HEADERS64>() > buffer.len()
-            {
-                continue;
+    || nt_header_pos + size_of::<IMAGE_NT_HEADERS64>() > buffer.len()
+{
+    let needed_size = nt_header_pos + std::cmp::max(size_of::<IMAGE_NT_HEADERS32>(), size_of::<IMAGE_NT_HEADERS64>());
+    let current_size = buffer.len();
+    if needed_size > current_size {
+        let metadata = file.metadata().expect("Failed to retrieve file metadata");
+        let file_size = metadata.len() as usize;
+        if needed_size > file_size {
+            log::warn!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Skipping...", offset + nt_header_pos);
+            eprintln!("{}", format!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Skipping...", offset + nt_header_pos).red());
+            continue;
+        }
+        if needed_size > 650 * 1024 * 1024 { // 650 MB
+            let needed_size_mb = needed_size as f64 / 1024.0 / 1024.0;
+            if needed_size_mb >= 1024.0 {
+                let needed_size_gb = needed_size_mb / 1024.0;
+                let message = format!("[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x}. Skipping...", needed_size_gb, offset + nt_header_pos);
+                log::warn!("{}", message);
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    SetForegroundColor(Color::Red),
+                    Print(message),
+                    ResetColor,
+                    Print("\n")
+                );
+            } else {
+                let message = format!("[x] Attempted to allocate a buffer of {:.2} MB at offset 0x{:x}. Skipping...", needed_size_mb, offset + nt_header_pos);
+                log::warn!("{}", message);
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    SetForegroundColor(Color::Red),
+                    Print(message),
+                    ResetColor,
+                    Print("\n")
+                );
             }
+            continue;
+        }
+        
+        
+        
+        
+        
+        let mut new_buffer = vec![0; needed_size];
+        new_buffer[..current_size].copy_from_slice(&buffer[..current_size]);
+        let read_bytes = file.read(&mut new_buffer[current_size..]).expect("Failed to read data");
+        if read_bytes < needed_size - current_size {
+            log::warn!("Not enough data to read NT Header at position {} (absolute offset 0x{:x}). It may be corrupted.", nt_header_pos, offset + nt_header_pos);
+            eprintln!("{}", format!("Not enough data to read NT Header at position {} (absolute offset 0x{:x}). It may be corrupted.", nt_header_pos, offset + nt_header_pos).red());
+            continue;
+        }
+        buffer = new_buffer;
+    }
+}
+
+        
 
             if buffer[nt_header_pos..nt_header_pos + 4] == [0x50, 0x45, 0x00, 0x00] {
                 let (magic_option, valid_magic) = safe_read::<u16>(&buffer[nt_header_pos + 0x18..]);
