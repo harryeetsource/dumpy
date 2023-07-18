@@ -17,6 +17,7 @@ use winapi::um::winnt::{
 use std::collections::HashSet;
 use colored::*;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use byteorder::{LittleEndian, WriteBytesExt};
 const CHUNK_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
 fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
@@ -31,7 +32,10 @@ fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
 
     mz_positions
 }
-
+fn trim_trailing_null_bytes(data: &[u8]) -> &[u8] {
+    let trimmed_length = data.iter().rposition(|&x| x != 0).map_or(0, |pos| pos + 1);
+    &data[..trimmed_length]
+}
 fn extract_executables(input_path: &str, output_path: &str) {
     let mut file = File::open(input_path).expect("Failed to open file");
     let mut offset: usize = 0;
@@ -117,6 +121,26 @@ fn extract_executables(input_path: &str, output_path: &str) {
                         ResetColor,
                         Print("\n")
                     );
+        
+                    // Extract the corrupted file
+let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
+let corrupted_data = &buffer[pos..effective_len];
+let trimmed_data = trim_trailing_null_bytes(corrupted_data);
+
+if let Ok(mut file) = File::create(&corrupted_file_path) {
+    if let Err(err) = file.write_all(trimmed_data) {
+        log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
+    } else {
+        // Update the section data size
+        if let Err(err) = file.seek(SeekFrom::Start(0)) {
+            log::error!("Failed to seek to the beginning of the file {}: {}", corrupted_file_path, err);
+        } else if let Err(err) = file.write_u64::<LittleEndian>(trimmed_data.len() as u64) {
+            log::error!("Failed to update section data size in file {}: {}", corrupted_file_path, err);
+        }
+    }
+} else {
+    log::error!("Failed to create the corrupted file {}", corrupted_file_path);
+}
                 }
             } else {
                 let mz_positions = find_mz_headers(&buffer[..effective_len]);
@@ -136,10 +160,32 @@ fn extract_executables(input_path: &str, output_path: &str) {
                         ResetColor,
                         Print("\n")
                     );
+        
+                    // Extract the corrupted file
+let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
+let corrupted_data = &buffer[pos..effective_len];
+let trimmed_data = trim_trailing_null_bytes(corrupted_data);
+
+if let Ok(mut file) = File::create(&corrupted_file_path) {
+    if let Err(err) = file.write_all(trimmed_data) {
+        log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
+    } else {
+        // Update the section data size
+        if let Err(err) = file.seek(SeekFrom::Start(0)) {
+            log::error!("Failed to seek to the beginning of the file {}: {}", corrupted_file_path, err);
+        } else if let Err(err) = file.write_u64::<LittleEndian>(trimmed_data.len() as u64) {
+            log::error!("Failed to update section data size in file {}: {}", corrupted_file_path, err);
+        }
+    }
+} else {
+    log::error!("Failed to create the corrupted file {}", corrupted_file_path);
+}
                 }
             }
             continue;
         }
+        
+        
         
         
         
