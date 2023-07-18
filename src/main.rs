@@ -101,28 +101,48 @@ fn extract_executables(input_path: &str, output_path: &str) {
             let needed_size_mb = needed_size as f64 / 1024.0 / 1024.0;
             if needed_size_mb >= 1024.0 {
                 let needed_size_gb = needed_size_mb / 1024.0;
-                let message = format!("[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x}. Skipping...", needed_size_gb, offset + nt_header_pos);
-                log::warn!("{}", message);
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    SetForegroundColor(Color::Red),
-                    Print(message),
-                    ResetColor,
-                    Print("\n")
-                );
+                let mz_positions = find_mz_headers(&buffer[..effective_len]);
+                for pos in mz_positions {
+                    let abs_offset = offset + pos;
+                    let message = format!(
+                        "[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x} in input file. Skipping...",
+                        needed_size_gb,
+                        abs_offset
+                    );
+                    log::warn!("{}", message);
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        SetForegroundColor(Color::Red),
+                        Print(message),
+                        ResetColor,
+                        Print("\n")
+                    );
+                }
             } else {
-                let message = format!("[x] Attempted to allocate a buffer of {:.2} MB at offset 0x{:x}. Skipping...", needed_size_mb, offset + nt_header_pos);
-                log::warn!("{}", message);
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    SetForegroundColor(Color::Red),
-                    Print(message),
-                    ResetColor,
-                    Print("\n")
-                );
+                let mz_positions = find_mz_headers(&buffer[..effective_len]);
+                for pos in mz_positions {
+                    let abs_offset = offset + pos;
+                    let needed_size_mb = needed_size as f64 / 1024.0 / 1024.0;
+                    let message = format!(
+                        "[x] Attempted to allocate a buffer of {:.2} MB at offset 0x{:x} in input file. Skipping...",
+                        needed_size_mb,
+                        abs_offset
+                    );
+                    log::warn!("{}", message);
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        SetForegroundColor(Color::Red),
+                        Print(message),
+                        ResetColor,
+                        Print("\n")
+                    );
+                }
             }
             continue;
         }
+        
+        
+        
         
         
         
