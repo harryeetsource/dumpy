@@ -59,10 +59,10 @@ fn extract_executables(input_path: &str, output_path: &str) {
         for pos in mz_offsets {
             if pos + size_of::<IMAGE_DOS_HEADER>() > buffer.len() {
                 log::warn!(
-                    "Offset {} exceeds buffer size at absolute offset {}. Skipping...",
+                    "Offset {} exceeds buffer size at absolute offset 0x{:x}. Skipping...",
                     pos,
                     offset + pos
-                );
+                );                
                 continue;
             }
         
