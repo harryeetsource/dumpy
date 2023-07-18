@@ -124,7 +124,7 @@ fn extract_executables(input_path: &str, output_path: &str) {
         
                     // Extract the corrupted file
 let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
-let corrupted_data = &buffer[pos..effective_len];
+let corrupted_data = &buffer[pos - 2..effective_len];  // Adjust the position by subtracting 2
 let trimmed_data = trim_trailing_null_bytes(corrupted_data);
 
 if let Ok(mut file) = File::create(&corrupted_file_path) {
@@ -141,6 +141,7 @@ if let Ok(mut file) = File::create(&corrupted_file_path) {
 } else {
     log::error!("Failed to create the corrupted file {}", corrupted_file_path);
 }
+
                 }
             } else {
                 let mz_positions = find_mz_headers(&buffer[..effective_len]);
@@ -163,7 +164,7 @@ if let Ok(mut file) = File::create(&corrupted_file_path) {
         
                     // Extract the corrupted file
 let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
-let corrupted_data = &buffer[pos..effective_len];
+let corrupted_data = &buffer[pos - 2..effective_len];  // Adjust the position by subtracting 2
 let trimmed_data = trim_trailing_null_bytes(corrupted_data);
 
 if let Ok(mut file) = File::create(&corrupted_file_path) {
@@ -180,6 +181,7 @@ if let Ok(mut file) = File::create(&corrupted_file_path) {
 } else {
     log::error!("Failed to create the corrupted file {}", corrupted_file_path);
 }
+
                 }
             }
             continue;
