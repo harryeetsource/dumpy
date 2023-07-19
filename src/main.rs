@@ -84,7 +84,7 @@ fn extract_executables(input_path: &str, output_path: &str) {
             let (dos_header, valid) =
                 safe_read::<IMAGE_DOS_HEADER>(&buffer[pos..pos + size_of::<IMAGE_DOS_HEADER>()]);
             if !valid {
-                log::warn!("Warning: Failed to read IMAGE_DOS_HEADER at position {} (absolute position {}). It may be corrupted.", pos, offset + pos);
+                log::warn!("Warning: Failed to read IMAGE_DOS_HEADER at position {} (absolute position {}). It may be corrupted, processing.", pos, offset + pos);
                 continue;
             }
 
@@ -111,8 +111,8 @@ fn extract_executables(input_path: &str, output_path: &str) {
                     let metadata = file.metadata().expect("Failed to retrieve file metadata");
                     let file_size = metadata.len() as usize;
                     if needed_size > file_size {
-                        log::warn!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Skipping...", offset + nt_header_pos);
-                        eprintln!("{}", format!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Skipping...", offset + nt_header_pos).red());
+                        log::warn!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Analyzing...", offset + nt_header_pos);
+                        eprintln!("{}", format!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Analyzing...", offset + nt_header_pos).red());
                         continue;
                     }
                     if needed_size > 650 * 1024 * 1024 {
@@ -124,7 +124,7 @@ fn extract_executables(input_path: &str, output_path: &str) {
                             for pos in mz_positions {
                                 let abs_offset = offset + pos;
                                 let message = format!(
-                                    "[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x} in input file. Processing corrupted file...",
+                                    "[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x} in input file. Processing possibly corrupted ELF file or 16-bit binary...",
                                     needed_size_gb,
                                     abs_offset
                                 );
