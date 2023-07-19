@@ -27,11 +27,13 @@ fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
     for pos in 0..buffer.len() - dos_magic.len() {
         if buffer[pos..pos + dos_magic.len()] == *dos_magic {
             mz_positions.push(pos);
+            log::debug!("Found MZ header at position {}", pos);  // Add debugging output
         }
     }
 
     mz_positions
 }
+
 fn trim_trailing_null_bytes(data: &[u8]) -> &[u8] {
     let trimmed_length = data.iter().rposition(|&x| x != 0).map_or(0, |pos| pos + 1);
     &data[..trimmed_length]
@@ -109,7 +111,7 @@ fn extract_executables(input_path: &str, output_path: &str) {
                 for pos in mz_positions {
                     let abs_offset = offset + pos;
                     let message = format!(
-                        "[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x} in input file. Skipping...",
+                        "[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x} in input file. Processing corrupted file...",
                         needed_size_gb,
                         abs_offset
                     );
@@ -124,7 +126,21 @@ fn extract_executables(input_path: &str, output_path: &str) {
         
                     // Extract the corrupted file
 let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
-let corrupted_data = &buffer[pos - 2..effective_len];  // Adjust the position by subtracting 2
+// Calculate relative position of the MZ header in the buffer
+let mz_relative_pos = abs_offset - offset;  
+let corrupted_data = &buffer[mz_relative_pos..effective_len];  // Now this will start from the MZ header
+
+
+// Verify MZ header
+let mz_header = [0x4D, 0x5A];  // MZ header in bytes
+if corrupted_data.get(0..2) != Some(&mz_header[..]) {
+    log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
+    log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
+    continue;
+}
+
+
+
 let trimmed_data = trim_trailing_null_bytes(corrupted_data);
 
 if let Ok(mut file) = File::create(&corrupted_file_path) {
@@ -142,6 +158,7 @@ if let Ok(mut file) = File::create(&corrupted_file_path) {
     log::error!("Failed to create the corrupted file {}", corrupted_file_path);
 }
 
+
                 }
             } else {
                 let mz_positions = find_mz_headers(&buffer[..effective_len]);
@@ -149,7 +166,7 @@ if let Ok(mut file) = File::create(&corrupted_file_path) {
                     let abs_offset = offset + pos;
                     let needed_size_mb = needed_size as f64 / 1024.0 / 1024.0;
                     let message = format!(
-                        "[x] Attempted to allocate a buffer of {:.2} MB at offset 0x{:x} in input file. Skipping...",
+                        "[x] Attempted to allocate a buffer of {:.2} MB at offset 0x{:x} in input file. Processing corrupted file...",
                         needed_size_mb,
                         abs_offset
                     );
@@ -164,7 +181,21 @@ if let Ok(mut file) = File::create(&corrupted_file_path) {
         
                     // Extract the corrupted file
 let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
-let corrupted_data = &buffer[pos - 2..effective_len];  // Adjust the position by subtracting 2
+// Calculate relative position of the MZ header in the buffer
+let mz_relative_pos = abs_offset - offset;  
+let corrupted_data = &buffer[mz_relative_pos..effective_len];  // Now this will start from the MZ header
+
+
+// Verify MZ header
+let mz_header = [0x4D, 0x5A];  // MZ header in bytes
+if corrupted_data.get(0..2) != Some(&mz_header[..]) {
+    log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
+    log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
+    continue;
+}
+
+
+
 let trimmed_data = trim_trailing_null_bytes(corrupted_data);
 
 if let Ok(mut file) = File::create(&corrupted_file_path) {
@@ -181,6 +212,7 @@ if let Ok(mut file) = File::create(&corrupted_file_path) {
 } else {
     log::error!("Failed to create the corrupted file {}", corrupted_file_path);
 }
+
 
                 }
             }
