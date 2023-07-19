@@ -1,9 +1,13 @@
+use byteorder::{LittleEndian, WriteBytesExt};
+use colored::*;
 use core::mem::size_of;
+use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crypto_hash::{Algorithm, Hasher};
 use hex;
 use log::LevelFilter;
 use simplelog::*;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::io::Read;
@@ -14,10 +18,6 @@ use winapi::um::winnt::{
     IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC,
     IMAGE_NT_OPTIONAL_HDR64_MAGIC,
 };
-use std::collections::HashSet;
-use colored::*;
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
-use byteorder::{LittleEndian, WriteBytesExt};
 const CHUNK_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 
 fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
@@ -27,17 +27,24 @@ fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
     for pos in 0..buffer.len() - dos_magic.len() {
         if buffer[pos..pos + dos_magic.len()] == *dos_magic {
             mz_positions.push(pos);
-            log::debug!("Found MZ header at position {}", pos);  // Add debugging output
         }
     }
 
     mz_positions
 }
-
 fn trim_trailing_null_bytes(data: &[u8]) -> &[u8] {
     let trimmed_length = data.iter().rposition(|&x| x != 0).map_or(0, |pos| pos + 1);
+    let original_size = data.len();
+    let trimmed_size = original_size - trimmed_length;
+
+    if trimmed_size > 0 {
+        let trimmed_mb = trimmed_size as f64 / 1_000_000.0;
+        log::warn!("Trimmed {:.2} MB of trailing null bytes", trimmed_mb);
+    }
+
     &data[..trimmed_length]
 }
+
 fn extract_executables(input_path: &str, output_path: &str) {
     let mut file = File::open(input_path).expect("Failed to open file");
     let mut offset: usize = 0;
@@ -70,11 +77,12 @@ fn extract_executables(input_path: &str, output_path: &str) {
                     "Offset {} exceeds buffer size at absolute offset 0x{:x}. Skipping...",
                     pos,
                     offset + pos
-                );                
+                );
                 continue;
             }
-        
-            let (dos_header, valid) = safe_read::<IMAGE_DOS_HEADER>(&buffer[pos..pos + size_of::<IMAGE_DOS_HEADER>()]);
+
+            let (dos_header, valid) =
+                safe_read::<IMAGE_DOS_HEADER>(&buffer[pos..pos + size_of::<IMAGE_DOS_HEADER>()]);
             if !valid {
                 log::warn!("Warning: Failed to read IMAGE_DOS_HEADER at position {} (absolute position {}). It may be corrupted.", pos, offset + pos);
                 continue;
@@ -91,156 +99,138 @@ fn extract_executables(input_path: &str, output_path: &str) {
 
             let nt_header_pos = pos + dos_header.e_lfanew as usize;
             if nt_header_pos + size_of::<IMAGE_NT_HEADERS32>() > buffer.len()
-    || nt_header_pos + size_of::<IMAGE_NT_HEADERS64>() > buffer.len()
-{
-    let needed_size = nt_header_pos + std::cmp::max(size_of::<IMAGE_NT_HEADERS32>(), size_of::<IMAGE_NT_HEADERS64>());
-    let current_size = buffer.len();
-    if needed_size > current_size {
-        let metadata = file.metadata().expect("Failed to retrieve file metadata");
-        let file_size = metadata.len() as usize;
-        if needed_size > file_size {
-            log::warn!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Skipping...", offset + nt_header_pos);
-            eprintln!("{}", format!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Skipping...", offset + nt_header_pos).red());
-            continue;
-        }
-        if needed_size > 650 * 1024 * 1024 { // 650 MB
-            let needed_size_mb = needed_size as f64 / 1024.0 / 1024.0;
-            if needed_size_mb >= 1024.0 {
-                let needed_size_gb = needed_size_mb / 1024.0;
-                let mz_positions = find_mz_headers(&buffer[..effective_len]);
-                for pos in mz_positions {
-                    let abs_offset = offset + pos;
-                    let message = format!(
-                        "[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x} in input file. Processing corrupted file...",
-                        needed_size_gb,
-                        abs_offset
+                || nt_header_pos + size_of::<IMAGE_NT_HEADERS64>() > buffer.len()
+            {
+                let needed_size = nt_header_pos
+                    + std::cmp::max(
+                        size_of::<IMAGE_NT_HEADERS32>(),
+                        size_of::<IMAGE_NT_HEADERS64>(),
                     );
-                    log::warn!("{}", message);
-                    let _ = crossterm::execute!(
-                        std::io::stdout(),
-                        SetForegroundColor(Color::Red),
-                        Print(message),
-                        ResetColor,
-                        Print("\n")
-                    );
-        
-                    // Extract the corrupted file
-let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
-// Calculate relative position of the MZ header in the buffer
-let mz_relative_pos = abs_offset - offset;  
-let corrupted_data = &buffer[mz_relative_pos..effective_len];  // Now this will start from the MZ header
+                let current_size = buffer.len();
+                if needed_size > current_size {
+                    let metadata = file.metadata().expect("Failed to retrieve file metadata");
+                    let file_size = metadata.len() as usize;
+                    if needed_size > file_size {
+                        log::warn!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Skipping...", offset + nt_header_pos);
+                        eprintln!("{}", format!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Skipping...", offset + nt_header_pos).red());
+                        continue;
+                    }
+                    if needed_size > 650 * 1024 * 1024 {
+                        // 650 MB
+                        let needed_size_mb = needed_size as f64 / 1024.0 / 1024.0;
+                        if needed_size_mb >= 1024.0 {
+                            let needed_size_gb = needed_size_mb / 1024.0;
+                            let mz_positions = find_mz_headers(&buffer[..effective_len]);
+                            for pos in mz_positions {
+                                let abs_offset = offset + pos;
+                                let message = format!(
+                                    "[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x} in input file. Processing corrupted file...",
+                                    needed_size_gb,
+                                    abs_offset
+                                );
+                                log::warn!("{}", message);
+                                let _ = crossterm::execute!(
+                                    std::io::stdout(),
+                                    SetForegroundColor(Color::Red),
+                                    Print(message),
+                                    ResetColor,
+                                    Print("\n")
+                                );
+                    
+                                // Calculate relative position of the MZ header in the buffer
+                                let mz_relative_pos = abs_offset - offset;
+                    
+                                // Now this will start from the MZ header
+                                let corrupted_data_end = std::cmp::min(effective_len, buffer.len());
+                                let corrupted_data = &buffer[mz_relative_pos..corrupted_data_end];
+                    
+                                // Verify MZ header
+                                let mz_header = [0x4D, 0x5A]; // MZ header in bytes
+                                if corrupted_data.get(0..2) != Some(&mz_header[..]) {
+                                    log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
+                                    log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
+                                    continue;
+                                }
+                    
+                                let trimmed_data = trim_trailing_null_bytes(corrupted_data);
+                                let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
+                                match File::create(&corrupted_file_path) {
+                                    Ok(mut file) => {
+                                        if let Err(err) = file.write_all(trimmed_data) {
+                                            log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        log::error!("Failed to create the corrupted file {}. Error kind: {:?}", corrupted_file_path, err.kind());
+                                    }
+                                }
+                            }
+                        } else {
+                            let mz_positions = find_mz_headers(&buffer[..effective_len]);
+                            for pos in mz_positions {
+                                let abs_offset = offset + pos;
+                                let message = format!(
+                                    "[x] Attempted to allocate a buffer of {:.2} MB at offset 0x{:x} in input file. Processing corrupted file...",
+                                    needed_size_mb,
+                                    abs_offset
+                                );
+                                log::warn!("{}", message);
+                                let _ = crossterm::execute!(
+                                    std::io::stdout(),
+                                    SetForegroundColor(Color::Red),
+                                    Print(message),
+                                    ResetColor,
+                                    Print("\n")
+                                );
+                    
+                                // Calculate relative position of the MZ header in the buffer
+                                let mz_relative_pos = abs_offset - offset;
+                    
+                                // Now this will start from the MZ header
+                                let corrupted_data_end = std::cmp::min(effective_len, buffer.len());
+                                let corrupted_data = &buffer[mz_relative_pos..corrupted_data_end];
+                    
+                                // Verify MZ header
+                                let mz_header = [0x4D, 0x5A]; // MZ header in bytes
+                                if corrupted_data.get(0..2) != Some(&mz_header[..]) {
+                                    log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
+                                    log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
+                                    continue;
+                                }
+                    
+                                let trimmed_data = trim_trailing_null_bytes(corrupted_data);
+                                let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
+                                match File::create(&corrupted_file_path) {
+                                    Ok(mut file) => {
+                                        if let Err(err) = file.write_all(trimmed_data) {
+                                            log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        log::error!("Failed to create the corrupted file {}. Full error: {}", corrupted_file_path, err);
+                                    }
+                                    
+                                }
+                            }
+                        }
+                    
+                    
+                        continue;
+                    }
 
-
-// Verify MZ header
-let mz_header = [0x4D, 0x5A];  // MZ header in bytes
-if corrupted_data.get(0..2) != Some(&mz_header[..]) {
-    log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
-    log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
-    continue;
-}
-
-
-
-let trimmed_data = trim_trailing_null_bytes(corrupted_data);
-
-if let Ok(mut file) = File::create(&corrupted_file_path) {
-    if let Err(err) = file.write_all(trimmed_data) {
-        log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
-    } else {
-        // Update the section data size
-        if let Err(err) = file.seek(SeekFrom::Start(0)) {
-            log::error!("Failed to seek to the beginning of the file {}: {}", corrupted_file_path, err);
-        } else if let Err(err) = file.write_u64::<LittleEndian>(trimmed_data.len() as u64) {
-            log::error!("Failed to update section data size in file {}: {}", corrupted_file_path, err);
-        }
-    }
-} else {
-    log::error!("Failed to create the corrupted file {}", corrupted_file_path);
-}
-
-
-                }
-            } else {
-                let mz_positions = find_mz_headers(&buffer[..effective_len]);
-                for pos in mz_positions {
-                    let abs_offset = offset + pos;
-                    let needed_size_mb = needed_size as f64 / 1024.0 / 1024.0;
-                    let message = format!(
-                        "[x] Attempted to allocate a buffer of {:.2} MB at offset 0x{:x} in input file. Processing corrupted file...",
-                        needed_size_mb,
-                        abs_offset
-                    );
-                    log::warn!("{}", message);
-                    let _ = crossterm::execute!(
-                        std::io::stdout(),
-                        SetForegroundColor(Color::Red),
-                        Print(message),
-                        ResetColor,
-                        Print("\n")
-                    );
-        
-                    // Extract the corrupted file
-let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
-// Calculate relative position of the MZ header in the buffer
-let mz_relative_pos = abs_offset - offset;  
-let corrupted_data = &buffer[mz_relative_pos..effective_len];  // Now this will start from the MZ header
-
-
-// Verify MZ header
-let mz_header = [0x4D, 0x5A];  // MZ header in bytes
-if corrupted_data.get(0..2) != Some(&mz_header[..]) {
-    log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
-    log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
-    continue;
-}
-
-
-
-let trimmed_data = trim_trailing_null_bytes(corrupted_data);
-
-if let Ok(mut file) = File::create(&corrupted_file_path) {
-    if let Err(err) = file.write_all(trimmed_data) {
-        log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
-    } else {
-        // Update the section data size
-        if let Err(err) = file.seek(SeekFrom::Start(0)) {
-            log::error!("Failed to seek to the beginning of the file {}: {}", corrupted_file_path, err);
-        } else if let Err(err) = file.write_u64::<LittleEndian>(trimmed_data.len() as u64) {
-            log::error!("Failed to update section data size in file {}: {}", corrupted_file_path, err);
-        }
-    }
-} else {
-    log::error!("Failed to create the corrupted file {}", corrupted_file_path);
-}
-
-
+                    let mut new_buffer = vec![0; needed_size];
+                    new_buffer[..current_size].copy_from_slice(&buffer[..current_size]);
+                    let read_bytes = file
+                        .read(&mut new_buffer[current_size..])
+                        .expect("Failed to read data");
+                    if read_bytes < needed_size - current_size {
+                        log::warn!("Not enough data to read NT Header at position {} (absolute offset 0x{:x}). It may be corrupted.", nt_header_pos, offset + nt_header_pos);
+                        eprintln!("{}", format!("Not enough data to read NT Header at position {} (absolute offset 0x{:x}). It may be corrupted.", nt_header_pos, offset + nt_header_pos).red());
+                        continue;
+                    }
+                    buffer = new_buffer;
                 }
             }
-            continue;
-        }
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        let mut new_buffer = vec![0; needed_size];
-        new_buffer[..current_size].copy_from_slice(&buffer[..current_size]);
-        let read_bytes = file.read(&mut new_buffer[current_size..]).expect("Failed to read data");
-        if read_bytes < needed_size - current_size {
-            log::warn!("Not enough data to read NT Header at position {} (absolute offset 0x{:x}). It may be corrupted.", nt_header_pos, offset + nt_header_pos);
-            eprintln!("{}", format!("Not enough data to read NT Header at position {} (absolute offset 0x{:x}). It may be corrupted.", nt_header_pos, offset + nt_header_pos).red());
-            continue;
-        }
-        buffer = new_buffer;
-    }
-}
-
-        
 
             if buffer[nt_header_pos..nt_header_pos + 4] == [0x50, 0x45, 0x00, 0x00] {
                 let (magic_option, valid_magic) = safe_read::<u16>(&buffer[nt_header_pos + 0x18..]);
@@ -398,7 +388,7 @@ if let Ok(mut file) = File::create(&corrupted_file_path) {
         } else {
             0
         };
-        
+
         if overlap_size > 0 {
             overlap = buffer[CHUNK_SIZE..].to_vec();
 
@@ -517,7 +507,14 @@ fn main() {
     }
     let log_config = ConfigBuilder::new().set_time_to_local(true).build();
 
-    let log_file = File::create("app.log").unwrap();
+    let log_dir = "./logs";
+    fs::create_dir_all(log_dir).expect("Failed to create directories");
+
+    // Create log file
+    let log_file_path = format!("{}/app.log", log_dir);
+    let log_file = File::create(&log_file_path).expect("Failed to create log file");
+
+    
 
     WriteLogger::init(LevelFilter::Info, log_config, log_file).unwrap();
     extract_executables(input_path, output_path);
