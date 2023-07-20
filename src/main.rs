@@ -58,14 +58,12 @@ fn extract_executables(input_path: &str, output_path: &str) {
     let mut file = File::open(input_path).expect("Failed to open file");
     let mut offset: usize = 0;
     let mut overlap = vec![0; 0];
-
-    loop {
-        let mut buffer = vec![0; CHUNK_SIZE + overlap.len()];
-
-
-        let bytes_read = file
+    let mut buffer = vec![0; CHUNK_SIZE + overlap.len()];
+    let mut bytes_read = file
     .read(&mut buffer[overlap.len()..])
     .expect("Failed to read data");
+    while bytes_read > 0 || !overlap.is_empty() {
+        
 
 
         // Check if there are no more bytes to read
@@ -122,8 +120,8 @@ fn extract_executables(input_path: &str, output_path: &str) {
                     let metadata = file.metadata().expect("Failed to retrieve file metadata");
                     let file_size = metadata.len() as usize;
                     if needed_size > file_size {
-                        log::warn!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Analyzing...", offset + nt_header_pos);
-                        eprintln!("{}", format!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file may be corrupted or incorrectly formatted. Analyzing...", offset + nt_header_pos).red());
+                        log::warn!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file metadata may be corrupted or incorrectly formatted. Analyzing...", offset + nt_header_pos);
+                        eprintln!("{}", format!("Warning: Attempt to read beyond file size at absolute offset 0x{:x}. The file metadata may be corrupted or incorrectly formatted. Analyzing...", offset + nt_header_pos).red());
                         continue;
                     }
                     if needed_size > 650 * 1024 * 1024 {
@@ -416,25 +414,27 @@ else {
         if overlap_size > 0 {
             overlap = buffer[CHUNK_SIZE..].to_vec();
 
-            // If no new bytes were read, don't seek backwards in the file
            // At the end of your loop...
-           if bytes_read > 0 {
-            if bytes_read >= overlap.len() {
-                file.seek(SeekFrom::Current(-(overlap.len() as i64)))
-                    .unwrap();
-                offset += bytes_read - overlap.len();
-            } else {
-                // Handle the special case here. For example:
-                file.seek(SeekFrom::Current(-(bytes_read as i64)))
-                    .unwrap();
-                offset += bytes_read;
-            }
+    if bytes_read > 0 {
+        if bytes_read >= overlap.len() {
+            file.seek(SeekFrom::Current(-(overlap.len() as i64)))
+                .unwrap();
+            offset += bytes_read - overlap.len();
         } else {
+            // Handle the special case here. For example:
+            file.seek(SeekFrom::Current(-(bytes_read as i64)))
+                .unwrap();
             offset += bytes_read;
         }
-        
-
-        }
+    } else {
+        offset += bytes_read;
+    }
+    
+    // Add this at the end of your loop to read in the next chunk of data:
+    bytes_read = file
+        .read(&mut buffer[overlap.len()..])
+        .unwrap_or(0);
+}
     }
 }
 
