@@ -143,40 +143,41 @@ fn extract_executables(input_path: &str, output_path: &str) {
                                 ResetColor,
                                 Print("\n")
                             );
-                    
+                        
                             // Calculate relative position of the MZ header in the buffer
-let mz_relative_pos = abs_offset - offset;
-
-// Get size of image from PE Optional Header
-if mz_relative_pos + 0x3F >= buffer.len() {
-    log::error!("PE header offset exceeds buffer size");
-    continue;
-}
-
-let pe_header_offset = u32::from_le_bytes([buffer[mz_relative_pos+0x3C], buffer[mz_relative_pos+0x3D], buffer[mz_relative_pos+0x3E], buffer[mz_relative_pos+0x3F]]) as usize;
-let optional_header_offset = pe_header_offset + 4 + 20;
-
-// Check if accessing image size exceeds buffer size
-if mz_relative_pos + optional_header_offset + 59 >= buffer.len() {
-    log::error!("PE image size offset exceeds buffer size");
-    continue;
-}
-
-let image_size = u32::from_le_bytes([
-    buffer[mz_relative_pos+optional_header_offset+56],
-    buffer[mz_relative_pos+optional_header_offset+57],
-    buffer[mz_relative_pos+optional_header_offset+58],
-    buffer[mz_relative_pos+optional_header_offset+59],
-]) as usize;
+                            let mz_relative_pos = abs_offset - offset;
+                        
+                            // Get size of image from PE Optional Header
+                            if mz_relative_pos + 0x3F >= buffer.len() {
+                                log::error!("PE header offset exceeds buffer size");
+                                continue;
+                            }
+                        
+                            let pe_header_offset = u32::from_le_bytes([buffer[mz_relative_pos+0x3C], buffer[mz_relative_pos+0x3D], buffer[mz_relative_pos+0x3E], buffer[mz_relative_pos+0x3F]]) as usize;
+                            let optional_header_offset = pe_header_offset + 4 + 20;
+                        
+                            // Check if accessing image size exceeds buffer size
+                            if mz_relative_pos + optional_header_offset + 59 >= buffer.len() {
+                                log::error!("PE image size offset exceeds buffer size");
+                                continue;
+                            }
+                        
+                            let image_size = u32::from_le_bytes([
+                                buffer[mz_relative_pos+optional_header_offset+56],
+                                buffer[mz_relative_pos+optional_header_offset+57],
+                                buffer[mz_relative_pos+optional_header_offset+58],
+                                buffer[mz_relative_pos+optional_header_offset+59],
+                            ]) as usize;
+                        
                             // Validate if the image size is under the limit and doesn't exceed the original buffer length
                             if image_size > 600 * 1024 * 1024 || mz_relative_pos + image_size > buffer.len() {
                                 log::error!("PE image size exceeds the limit or original buffer length");
                                 continue;
                             }
-                    
+                        
                             // This will start from the MZ header and span the entire image size
                             let corrupted_data = &buffer[mz_relative_pos..mz_relative_pos+image_size];
-                    
+                        
                             // Verify MZ header
                             let mz_header = [0x4D, 0x5A]; // MZ header in bytes
                             if corrupted_data.get(0..2) != Some(&mz_header[..]) {
@@ -184,19 +185,41 @@ let image_size = u32::from_le_bytes([
                                 log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
                                 continue;
                             }
-                    
+                        
+                            // Get a vector of bytes from the buffer to write
                             let trimmed_data = trim_trailing_null_bytes(corrupted_data);
-                            let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
-                            match File::create(&corrupted_file_path) {
-                                Ok(mut file) => {
-                                    if let Err(err) = file.write_all(trimmed_data) {
-                                        log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
-                                    }
-                                }
-                                Err(err) => {
-                                    log::error!("Failed to create the corrupted file {}. Error kind: {:?}", corrupted_file_path, err.kind());
-                                }
-                            }
+                        
+                            // Convert this byte slice to Vec<u8>
+                            let mut trimmed_data_vec = trimmed_data.to_vec();
+                        
+                            // Construct header string
+                            let header_str = format!("MZ at offset 0x{:x}", abs_offset);
+                        
+                            // header_bytes: size of the header
+                            let header_bytes = trimmed_data_vec.len(); // since it is trimmed data, assuming it is all header
+                        
+                            // file_alignment: This might be fetched from IMAGE_NT_HEADERS32 or IMAGE_NT_HEADERS64 
+                            let file_alignment = 512; // adjust this as per your requirements
+                        
+                            // valid: validity of the file
+                            let valid = true; // assuming the file is valid, adjust this as per your requirements
+                        
+                            // pos: position in buffer
+                            let pos = 0; // As trimmed_data is independent of the buffer, position is 0
+                        
+                            write_file(
+                                &mut trimmed_data_vec,
+                                Cow::Borrowed(&header_str),
+                                header_bytes,
+                                file_alignment,
+                                valid,
+                                pos,
+                                abs_offset,
+                                output_path,
+                                &mut count,
+                                &mut headers,
+                            );
+                            
                         }
                     }
                     
@@ -383,12 +406,15 @@ else {
             overlap = buffer[CHUNK_SIZE..].to_vec();
 
             // If no new bytes were read, don't seek backwards in the file
-            if bytes_read > 0 {
-                file.seek(SeekFrom::Current(-(overlap.len() as i64)))
-                    .unwrap();
-            }
-        } else {
-            overlap.clear();
+           // At the end of your loop...
+if bytes_read > 0 {
+    file.seek(SeekFrom::Current(-(overlap.len() as i64)))
+        .unwrap();
+    offset += bytes_read - overlap.len();
+} else {
+    offset += bytes_read;
+}
+
         }
     }
 }
