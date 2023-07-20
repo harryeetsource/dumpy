@@ -51,11 +51,13 @@ fn extract_executables(input_path: &str, output_path: &str) {
     let mut overlap = vec![0; 0];
 
     loop {
-        let mut buffer = vec![0; CHUNK_SIZE + 0x200];
+        let mut buffer = vec![0; CHUNK_SIZE + overlap.len()];
+
 
         let bytes_read = file
-            .read(&mut buffer[overlap.len()..])
-            .expect("Failed to read data");
+    .read(&mut buffer[overlap.len()..])
+    .expect("Failed to read data");
+
 
         // Check if there are no more bytes to read
         if bytes_read == 0 && overlap.is_empty() {
