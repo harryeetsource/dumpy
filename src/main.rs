@@ -1,7 +1,7 @@
 
 use colored::*;
 use core::mem::size_of;
-use crossterm::{execute, style::{Color, Print, ResetColor, SetForegroundColor}};
+use crossterm::{execute, style::{Print, SetForegroundColor, ResetColor, Color}};
 use crypto_hash::{Algorithm, Hasher};
 use hex;
 use log::LevelFilter;
@@ -469,7 +469,12 @@ fn write_file(
 
     let end = pos + header_bytes;
     if end > data.len() {
-        println!("Header bytes exceed data length. Skipping...");
+        let _ = execute!(
+            stdout(),
+            SetForegroundColor(Color::Red),
+            Print("Header bytes exceed data length. Skipping...\n"),
+            ResetColor
+        );
         return;
     }
 
@@ -492,9 +497,11 @@ fn write_file(
         let end = pos + header_bytes + padding;
 
         if end > data.len() {
-            println!(
-                "File at offset {} is too large or corrupted. Skipping...",
-                offset
+            let _ = execute!(
+                stdout(),
+                SetForegroundColor(Color::Yellow),
+                Print(format!("File at offset {} is too large or corrupted. Skipping...\n", offset)),
+                ResetColor
             );
             return;
         }
@@ -504,17 +511,30 @@ fn write_file(
             .expect("Failed to write data");
 
         if valid {
-            println!("Extracted file: {}", filename);
+            let _ = execute!(
+                stdout(),
+                SetForegroundColor(Color::Green),
+                Print(format!("Extracted file: {}\n", filename)),
+                ResetColor
+            );
         } else {
-            println!("Warning: Extracted possibly corrupted file: {}", filename);
+            let _ = execute!(
+                stdout(),
+                SetForegroundColor(Color::Yellow),
+                Print(format!("Warning: Extracted possibly corrupted file: {}\n", filename)),
+                ResetColor
+            );
         }
     } else {
-        println!(
-            "Duplicate executable with header hash {} skipped",
-            header_hash
+        let _ = execute!(
+            stdout(),
+            SetForegroundColor(Color::Blue),
+            Print(format!("Duplicate executable with header hash {} skipped\n", header_hash)),
+            ResetColor
         );
     }
 }
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
