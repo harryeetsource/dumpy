@@ -58,12 +58,13 @@ fn extract_executables(input_path: &str, output_path: &str) {
     let mut file = File::open(input_path).expect("Failed to open file");
     let mut offset: usize = 0;
     let mut overlap = vec![0; 0];
+    
     let mut buffer = vec![0; CHUNK_SIZE + overlap.len()];
-    let mut bytes_read = file
-    .read(&mut buffer[overlap.len()..])
-    .expect("Failed to read data");
+    let mut bytes_read = file.read(&mut buffer[overlap.len()..]).unwrap_or(0); 
+
     while bytes_read > 0 || !overlap.is_empty() {
-        
+        let mut buffer = vec![0; CHUNK_SIZE + overlap.len()]; // Move this line inside the loop
+    bytes_read = file.read(&mut buffer[overlap.len()..]).unwrap_or(0); // This line is moved here
 
 
         // Check if there are no more bytes to read
@@ -430,10 +431,30 @@ else {
         offset += bytes_read;
     }
     
+    // Set the overlap
+    let overlap_size = if bytes_read > 0 {
+        buffer.len().saturating_sub(CHUNK_SIZE)
+    } else {
+        0
+    };
+    if overlap_size > 0 {
+        overlap = buffer[CHUNK_SIZE..].to_vec();
+    }
+
+    // Seek back if overlap exists
+    if bytes_read > 0 && !overlap.is_empty() {
+        file.seek(SeekFrom::Current(-(overlap.len() as i64)))
+            .unwrap();
+        offset += bytes_read - overlap.len();
+    } else {
+        offset += bytes_read;
+    }
+
+    // Create a new buffer with the size of CHUNK_SIZE + overlap.len()
+    buffer = vec![0; CHUNK_SIZE + overlap.len()];
+
     // Add this at the end of your loop to read in the next chunk of data:
-    bytes_read = file
-        .read(&mut buffer[overlap.len()..])
-        .unwrap_or(0);
+    bytes_read = file.read(&mut buffer[overlap.len()..]).unwrap_or(0);
 }
     }
 }
