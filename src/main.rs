@@ -1,4 +1,4 @@
-use byteorder::{LittleEndian, WriteBytesExt};
+
 use colored::*;
 use core::mem::size_of;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
@@ -118,101 +118,91 @@ fn extract_executables(input_path: &str, output_path: &str) {
                     if needed_size > 650 * 1024 * 1024 {
                         // 650 MB
                         let needed_size_mb = needed_size as f64 / 1024.0 / 1024.0;
-                        if needed_size_mb >= 1024.0 {
-                            let needed_size_gb = needed_size_mb / 1024.0;
-                            let mz_positions = find_mz_headers(&buffer[..effective_len]);
-                            for pos in mz_positions {
-                                let abs_offset = offset + pos;
-                                let message = format!(
+                        let mz_positions = find_mz_headers(&buffer[..effective_len]);
+                        for pos in mz_positions {
+                            let abs_offset = offset + pos;
+                            let message = if needed_size_mb >= 1024.0 {
+                                let needed_size_gb = needed_size_mb / 1024.0;
+                                format!(
                                     "[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x} in input file. Processing possibly corrupted ELF file or 16-bit binary...",
                                     needed_size_gb,
                                     abs_offset
-                                );
-                                log::warn!("{}", message);
-                                let _ = crossterm::execute!(
-                                    std::io::stdout(),
-                                    SetForegroundColor(Color::Red),
-                                    Print(message),
-                                    ResetColor,
-                                    Print("\n")
-                                );
-                    
-                                // Calculate relative position of the MZ header in the buffer
-                                let mz_relative_pos = abs_offset - offset;
-                    
-                                // Now this will start from the MZ header
-                                let corrupted_data_end = std::cmp::min(effective_len, buffer.len());
-                                let corrupted_data = &buffer[mz_relative_pos..corrupted_data_end];
-                    
-                                // Verify MZ header
-                                let mz_header = [0x4D, 0x5A]; // MZ header in bytes
-                                if corrupted_data.get(0..2) != Some(&mz_header[..]) {
-                                    log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
-                                    log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
-                                    continue;
-                                }
-                    
-                                let trimmed_data = trim_trailing_null_bytes(corrupted_data);
-                                let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
-                                match File::create(&corrupted_file_path) {
-                                    Ok(mut file) => {
-                                        if let Err(err) = file.write_all(trimmed_data) {
-                                            log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
-                                        }
-                                    }
-                                    Err(err) => {
-                                        log::error!("Failed to create the corrupted file {}. Error kind: {:?}", corrupted_file_path, err.kind());
-                                    }
-                                }
-                            }
-                        } else {
-                            let mz_positions = find_mz_headers(&buffer[..effective_len]);
-                            for pos in mz_positions {
-                                let abs_offset = offset + pos;
-                                let message = format!(
+                                )
+                            } else {
+                                format!(
                                     "[x] Attempted to allocate a buffer of {:.2} MB at offset 0x{:x} in input file. Processing corrupted file...",
                                     needed_size_mb,
                                     abs_offset
-                                );
-                                log::warn!("{}", message);
-                                let _ = crossterm::execute!(
-                                    std::io::stdout(),
-                                    SetForegroundColor(Color::Red),
-                                    Print(message),
-                                    ResetColor,
-                                    Print("\n")
-                                );
+                                )
+                            };
+                            log::warn!("{}", message);
+                            let _ = crossterm::execute!(
+                                std::io::stdout(),
+                                SetForegroundColor(Color::Red),
+                                Print(message),
+                                ResetColor,
+                                Print("\n")
+                            );
                     
-                                // Calculate relative position of the MZ header in the buffer
-                                let mz_relative_pos = abs_offset - offset;
+                            // Calculate relative position of the MZ header in the buffer
+let mz_relative_pos = abs_offset - offset;
+
+// Get size of image from PE Optional Header
+if mz_relative_pos + 0x3F >= buffer.len() {
+    log::error!("PE header offset exceeds buffer size");
+    continue;
+}
+
+let pe_header_offset = u32::from_le_bytes([buffer[mz_relative_pos+0x3C], buffer[mz_relative_pos+0x3D], buffer[mz_relative_pos+0x3E], buffer[mz_relative_pos+0x3F]]) as usize;
+let optional_header_offset = pe_header_offset + 4 + 20;
+
+// Check if accessing image size exceeds buffer size
+if mz_relative_pos + optional_header_offset + 59 >= buffer.len() {
+    log::error!("PE image size offset exceeds buffer size");
+    continue;
+}
+
+let image_size = u32::from_le_bytes([
+    buffer[mz_relative_pos+optional_header_offset+56],
+    buffer[mz_relative_pos+optional_header_offset+57],
+    buffer[mz_relative_pos+optional_header_offset+58],
+    buffer[mz_relative_pos+optional_header_offset+59],
+]) as usize;
+                            // Validate if the image size is under the limit and doesn't exceed the original buffer length
+                            if image_size > 600 * 1024 * 1024 || mz_relative_pos + image_size > buffer.len() {
+                                log::error!("PE image size exceeds the limit or original buffer length");
+                                continue;
+                            }
                     
-                                // Now this will start from the MZ header
-                                let corrupted_data_end = std::cmp::min(effective_len, buffer.len());
-                                let corrupted_data = &buffer[mz_relative_pos..corrupted_data_end];
+                            // This will start from the MZ header and span the entire image size
+                            let corrupted_data = &buffer[mz_relative_pos..mz_relative_pos+image_size];
                     
-                                // Verify MZ header
-                                let mz_header = [0x4D, 0x5A]; // MZ header in bytes
-                                if corrupted_data.get(0..2) != Some(&mz_header[..]) {
-                                    log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
-                                    log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
-                                    continue;
+                            // Verify MZ header
+                            let mz_header = [0x4D, 0x5A]; // MZ header in bytes
+                            if corrupted_data.get(0..2) != Some(&mz_header[..]) {
+                                log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
+                                log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
+                                continue;
+                            }
+                    
+                            let trimmed_data = trim_trailing_null_bytes(corrupted_data);
+                            let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
+                            match File::create(&corrupted_file_path) {
+                                Ok(mut file) => {
+                                    if let Err(err) = file.write_all(trimmed_data) {
+                                        log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
+                                    }
                                 }
-                    
-                                let trimmed_data = trim_trailing_null_bytes(corrupted_data);
-                                let corrupted_file_path = format!("corrupted_file_0x{:x}.exe", abs_offset);
-                                match File::create(&corrupted_file_path) {
-                                    Ok(mut file) => {
-                                        if let Err(err) = file.write_all(trimmed_data) {
-                                            log::error!("Failed to write the corrupted file {}: {}", corrupted_file_path, err);
-                                        }
-                                    }
-                                    Err(err) => {
-                                        log::error!("Failed to create the corrupted file {}. Full error: {}", corrupted_file_path, err);
-                                    }
-                                    
+                                Err(err) => {
+                                    log::error!("Failed to create the corrupted file {}. Error kind: {:?}", corrupted_file_path, err.kind());
                                 }
                             }
                         }
+                    }
+                    
+else {
+    log::error!("PE image size exceeds the limit or original buffer length");
+                    
                     
                     
                         continue;
