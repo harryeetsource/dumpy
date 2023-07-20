@@ -1,7 +1,7 @@
 
 use colored::*;
 use core::mem::size_of;
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::{execute, style::{Color, Print, ResetColor, SetForegroundColor}};
 use crypto_hash::{Algorithm, Hasher};
 use hex;
 use log::LevelFilter;
@@ -18,16 +18,17 @@ use winapi::um::winnt::{
     IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC,
     IMAGE_NT_OPTIONAL_HDR64_MAGIC,
 };
+use std::io::stdout;
 const CHUNK_SIZE: usize = 1024 * 1024 * 1024; // 1GB
-
+use twoway::find_bytes;
 fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
     let dos_magic = b"MZ";
     let mut mz_positions = Vec::new();
+    let mut start = 0;
 
-    for pos in 0..buffer.len() - dos_magic.len() {
-        if buffer[pos..pos + dos_magic.len()] == *dos_magic {
-            mz_positions.push(pos);
-        }
+    while let Some(pos) = find_bytes(&buffer[start..], dos_magic) {
+        mz_positions.push(start + pos);
+        start += pos + dos_magic.len();
     }
 
     mz_positions
@@ -40,6 +41,14 @@ fn trim_trailing_null_bytes(data: &[u8]) -> &[u8] {
     if trimmed_size > 0 {
         let trimmed_mb = trimmed_size as f64 / 1_000_000.0;
         log::warn!("Trimmed {:.2} MB of trailing null bytes", trimmed_mb);
+        let message = format!("Trimmed {:.2} MB of trailing null bytes", trimmed_mb);
+        let _ = execute!(
+            stdout(),
+            SetForegroundColor(Color::Green),
+            Print(message),
+            ResetColor,
+            Print("\n")
+        );
     }
 
     &data[..trimmed_length]
@@ -126,13 +135,13 @@ fn extract_executables(input_path: &str, output_path: &str) {
                             let message = if needed_size_mb >= 1024.0 {
                                 let needed_size_gb = needed_size_mb / 1024.0;
                                 format!(
-                                    "[x] Attempted to allocate a buffer of {:.2} GB at offset 0x{:x} in input file. Processing possibly corrupted ELF file or 16-bit binary...",
+                                    "[x] NT Header from executable file reported size of {:.2} GB at offset 0x{:x} in input file. Processing possibly corrupted ELF file or 16-bit binary...",
                                     needed_size_gb,
                                     abs_offset
                                 )
                             } else {
                                 format!(
-                                    "[x] Attempted to allocate a buffer of {:.2} MB at offset 0x{:x} in input file. Processing corrupted file...",
+                                    "[x]  NT Header from executable file reported size of {:.2} MB at offset 0x{:x} in input file. Processing corrupted file...",
                                     needed_size_mb,
                                     abs_offset
                                 )
@@ -201,7 +210,7 @@ fn extract_executables(input_path: &str, output_path: &str) {
                             let header_bytes = trimmed_data_vec.len(); // since it is trimmed data, assuming it is all header
                         
                             // file_alignment: This might be fetched from IMAGE_NT_HEADERS32 or IMAGE_NT_HEADERS64 
-                            let file_alignment = 512; // adjust this as per your requirements
+                            let file_alignment = 4096; // adjust this as per your requirements
                         
                             // valid: validity of the file
                             let valid = true; // assuming the file is valid, adjust this as per your requirements
@@ -409,13 +418,21 @@ else {
 
             // If no new bytes were read, don't seek backwards in the file
            // At the end of your loop...
-if bytes_read > 0 {
-    file.seek(SeekFrom::Current(-(overlap.len() as i64)))
-        .unwrap();
-    offset += bytes_read - overlap.len();
-} else {
-    offset += bytes_read;
-}
+           if bytes_read > 0 {
+            if bytes_read >= overlap.len() {
+                file.seek(SeekFrom::Current(-(overlap.len() as i64)))
+                    .unwrap();
+                offset += bytes_read - overlap.len();
+            } else {
+                // Handle the special case here. For example:
+                file.seek(SeekFrom::Current(-(bytes_read as i64)))
+                    .unwrap();
+                offset += bytes_read;
+            }
+        } else {
+            offset += bytes_read;
+        }
+        
 
         }
     }

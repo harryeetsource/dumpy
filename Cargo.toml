@@ -14,3 +14,6 @@ log = "0.4"
 simplelog = "0.10"
 colored = "2.0"
 crossterm = "0.20.0"
+xz2 = "0.1.7"
+twoway = "0.2.2"
+
