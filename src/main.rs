@@ -76,7 +76,8 @@ fn validate_and_extract_image(buffer: &mut Vec<u8>, pos: usize, abs_offset: usiz
     }
 
     // Get a vector of bytes from the buffer to write
-    let trimmed_data = trim_trailing_null_bytes(corrupted_data);
+    let trimmed_data = trim_or_extend_data(corrupted_data, image_size);
+
 
     // Convert this byte slice to Vec<u8>
     let trimmed_data_vec = trimmed_data.to_vec();

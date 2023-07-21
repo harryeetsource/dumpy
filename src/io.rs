@@ -99,15 +99,34 @@ pub fn handle_large_size(
         }
     }
 }
-pub fn trim_trailing_null_bytes(data: &[u8]) -> &[u8] {
-    let trimmed_length = data.iter().rposition(|&x| x != 0).map_or(0, |pos| pos + 1);
+pub fn trim_or_extend_data(data: &[u8], image_size: usize) -> Vec<u8> {
     let original_size = data.len();
-    let trimmed_size = original_size - trimmed_length;
 
-    if trimmed_size > 0 {
-        let trimmed_mb = trimmed_size as f64 / 1_000_000.0;
-        log::warn!("Trimmed {:.2} MB of trailing null bytes", trimmed_mb);
-        let message = format!("Trimmed {:.2} MB of trailing null bytes", trimmed_mb);
+    let mut new_data = Vec::from(data);
+    if original_size > image_size {
+        let trimmed_length = data.iter().rposition(|&x| x != 0).map_or(0, |pos| pos + 1);
+        new_data.truncate(trimmed_length);
+        let trimmed_size = original_size - trimmed_length;
+
+        if trimmed_size > 0 {
+            let trimmed_mb = trimmed_size as f64 / 1_000_000.0;
+            log::warn!("Trimmed {:.2} MB of trailing null bytes", trimmed_mb);
+            let message = format!("Trimmed {:.2} MB of trailing null bytes", trimmed_mb);
+            let _ = execute!(
+                stdout(),
+                SetForegroundColor(Color::Green),
+                Print(message),
+                ResetColor,
+                Print("\n")
+            );
+        }
+    } else if original_size < image_size {
+        let padding_needed = image_size - original_size;
+        new_data.resize(image_size, 0);
+
+        let padding_mb = padding_needed as f64 / 1_000_000.0;
+        log::warn!("Padded with {:.2} MB of trailing null bytes", padding_mb);
+        let message = format!("Padded with {:.2} MB of trailing null bytes", padding_mb);
         let _ = execute!(
             stdout(),
             SetForegroundColor(Color::Green),
@@ -117,8 +136,9 @@ pub fn trim_trailing_null_bytes(data: &[u8]) -> &[u8] {
         );
     }
 
-    &data[..trimmed_length]
+    new_data
 }
+
 pub fn read_file_chunk(file: &mut File, overlap: Vec<u8>) -> (Vec<u8>, usize, bool) {
     let offset: usize = 0;
     let mut buffer = vec![0; CHUNK_SIZE + overlap.len()];
