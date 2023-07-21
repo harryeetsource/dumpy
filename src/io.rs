@@ -114,7 +114,7 @@ pub fn trim_or_extend_data(data: &[u8], image_size: usize) -> Vec<u8> {
             let message = format!("Trimmed {:.2} MB of trailing null bytes", trimmed_mb);
             let _ = execute!(
                 stdout(),
-                SetForegroundColor(Color::Green),
+                SetForegroundColor(Color::Yellow),
                 Print(message),
                 ResetColor,
                 Print("\n")
@@ -129,7 +129,7 @@ pub fn trim_or_extend_data(data: &[u8], image_size: usize) -> Vec<u8> {
         let message = format!("Padded with {:.2} MB of trailing null bytes", padding_mb);
         let _ = execute!(
             stdout(),
-            SetForegroundColor(Color::Green),
+            SetForegroundColor(Color::Yellow),
             Print(message),
             ResetColor,
             Print("\n")
