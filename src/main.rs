@@ -106,7 +106,7 @@ fn process_mz_offsets(
     for pos in mz_offsets {
         if pos + size_of::<IMAGE_DOS_HEADER>() > buffer.len() {
             let message = format!(
-                "Offset {} exceeds buffer size at absolute offset 0x{:x}. Skipping...",
+                "Offset 0x{:x} exceeds buffer size at absolute offset 0x{:x}. Skipping...",
                 pos,
                 *offset + pos
             );
