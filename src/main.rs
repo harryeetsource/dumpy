@@ -34,15 +34,23 @@ fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
 }
 fn validate_and_extract_image(buffer: &mut Vec<u8>, pos: usize, abs_offset: usize, _needed_size: usize) -> bool {
     // Calculate relative position of the MZ header in the buffer
-    let mz_relative_pos = abs_offset - pos;
+    let mz_relative_pos = abs_offset.wrapping_sub(pos); // this will safely handle underflows
 
-    // Get size of image from PE Optional Header
-    if mz_relative_pos + 0x3F >= buffer.len() {
+    // Ensure the buffer is long enough to include the PE header
+    if mz_relative_pos + 0x3C + 4 > buffer.len() { // add 4 because we're accessing four bytes
         log::error!("PE header offset exceeds buffer size");
         return false;
     }
 
-    let pe_header_offset = u32::from_le_bytes([buffer[mz_relative_pos+0x3C], buffer[mz_relative_pos+0x3D], buffer[mz_relative_pos+0x3E], buffer[mz_relative_pos+0x3F]]) as usize;
+    // Get size of image from PE Optional Header
+    let pe_header_offset = u32::from_le_bytes([
+        buffer[mz_relative_pos+0x3C], 
+        buffer[mz_relative_pos+0x3D], 
+        buffer[mz_relative_pos+0x3E], 
+        buffer[mz_relative_pos+0x3F]
+    ]) as usize;
+    
+
     let optional_header_offset = pe_header_offset + 4 + 20;
 
     // Check if accessing image size exceeds buffer size
