@@ -1,25 +1,32 @@
-
+use crate::fs::File;
 use colored::*;
 use core::mem::size_of;
-use crossterm::{execute, style::{Print, SetForegroundColor, ResetColor, Color}};
+use crossterm::{
+    execute,
+    style::{Color, Print, ResetColor, SetForegroundColor},
+};
 use crypto_hash::{Algorithm, Hasher};
 use hex;
 use log::LevelFilter;
 use simplelog::*;
 use std::borrow::Cow;
 use std::collections::HashSet;
-use winapi::um::winnt::{
-    IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64, IMAGE_NT_OPTIONAL_HDR32_MAGIC,
-    IMAGE_NT_OPTIONAL_HDR64_MAGIC,
-};
 use std::fs;
-use crate::fs::File;
 use std::io::Read;
+use windows::Win32::System::Diagnostics::Debug::{
+    IMAGE_DIRECTORY_ENTRY_IMPORT, IMAGE_NT_HEADERS32, IMAGE_NT_HEADERS64,
+    IMAGE_NT_OPTIONAL_HDR32_MAGIC, IMAGE_NT_OPTIONAL_HDR64_MAGIC, IMAGE_SECTION_HEADER, IMAGE_FILE_HEADER, IMAGE_DIRECTORY_ENTRY_EXPORT,
+};
+use windows::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_IMPORT_DESCRIPTOR, IMAGE_EXPORT_DIRECTORY};
 mod io;
 use crate::io::*;
+use std::error::Error;
 use std::io::stdout;
+use std::path::Path;
 const CHUNK_SIZE: usize = 1024 * 1024 * 1024; // 1GB
 use twoway::find_bytes;
+mod rebuild;
+use rebuild::process_extracted_pe;
 fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
     let dos_magic = b"MZ";
     let mut mz_positions = Vec::new();
@@ -32,67 +39,77 @@ fn find_mz_headers(buffer: &[u8]) -> Vec<usize> {
 
     mz_positions
 }
-fn validate_and_extract_image(buffer: &mut Vec<u8>, pos: usize, abs_offset: usize, _needed_size: usize) -> bool {
-    // Calculate relative position of the MZ header in the buffer
-    let mz_relative_pos = abs_offset.wrapping_sub(pos); // this will safely handle underflows
 
-    // Ensure the buffer is long enough to include the PE header
-    if mz_relative_pos + 0x3C + 4 > buffer.len() { // add 4 because we're accessing four bytes
-        log::error!("PE header offset exceeds buffer size");
-        return false;
+
+// validate_and_extract_image now returns a Result<(), String>
+fn validate_and_extract_image(
+    buffer: &mut Vec<u8>,
+    pos: usize,
+    abs_offset: usize,
+    _needed_size: usize,
+    output_path: &str,
+    count: &mut u32,
+    header_bytes: usize,
+    file_alignment: usize,
+    valid: bool,
+    headers: &mut HashSet<String>,
+) -> Result<(), String> {
+    let mz_relative_pos = abs_offset.wrapping_sub(pos);
+
+    if mz_relative_pos + 0x3C + 4 > buffer.len() {
+        return Err("PE header offset exceeds buffer size".into());
     }
 
-    // Get size of image from PE Optional Header
     let pe_header_offset = u32::from_le_bytes([
-        buffer[mz_relative_pos+0x3C], 
-        buffer[mz_relative_pos+0x3D], 
-        buffer[mz_relative_pos+0x3E], 
-        buffer[mz_relative_pos+0x3F]
+        buffer[mz_relative_pos + 0x3C],
+        buffer[mz_relative_pos + 0x3D],
+        buffer[mz_relative_pos + 0x3E],
+        buffer[mz_relative_pos + 0x3F],
     ]) as usize;
-    
-
     let optional_header_offset = pe_header_offset + 4 + 20;
 
-    // Check if accessing image size exceeds buffer size
     if mz_relative_pos + optional_header_offset + 59 >= buffer.len() {
-        log::error!("PE image size offset exceeds buffer size");
-        return false;
+        return Err("PE image size offset exceeds buffer size".into());
     }
 
     let image_size = u32::from_le_bytes([
-        buffer[mz_relative_pos+optional_header_offset+56],
-        buffer[mz_relative_pos+optional_header_offset+57],
-        buffer[mz_relative_pos+optional_header_offset+58],
-        buffer[mz_relative_pos+optional_header_offset+59],
+        buffer[mz_relative_pos + optional_header_offset + 56],
+        buffer[mz_relative_pos + optional_header_offset + 57],
+        buffer[mz_relative_pos + optional_header_offset + 58],
+        buffer[mz_relative_pos + optional_header_offset + 59],
     ]) as usize;
 
-    // Validate if the image size is under the limit and doesn't exceed the original buffer length
     if image_size > 600 * 1024 * 1024 || mz_relative_pos + image_size > buffer.len() {
-        log::error!("PE image size exceeds the limit or original buffer length");
-        return false;
+        return Err("PE image size exceeds the limit or original buffer length".into());
     }
 
-    // This will start from the MZ header and span the entire image size
-    let corrupted_data = &buffer[mz_relative_pos..mz_relative_pos+image_size];
-
-    // Verify MZ header
-    let mz_header = [0x4D, 0x5A]; // MZ header in bytes
+    let corrupted_data = &buffer[mz_relative_pos..mz_relative_pos + image_size];
+    let mz_header = [0x4D, 0x5A];
     if corrupted_data.get(0..2) != Some(&mz_header[..]) {
-        log::debug!("Data at offset: {:?}", corrupted_data.get(0..2));
-        log::warn!("MZ header not found at offset 0x{:x}. Skipping extraction of the corrupted file.", abs_offset);
-        return false;
+        return Err(format!("MZ header not found at offset 0x{:x}", abs_offset));
     }
 
-    // Get a vector of bytes from the buffer to write
     let trimmed_data = trim_or_extend_data(corrupted_data, image_size);
-
-
-    // Convert this byte slice to Vec<u8>
     let trimmed_data_vec = trimmed_data.to_vec();
+    log::debug!("Extracted PE image length: {}", trimmed_data_vec.len());
 
-    // Replace the original buffer data with the trimmed data
-    *buffer = trimmed_data_vec;
-    true
+    // Now call handle_extracted_pe with the trimmed image.
+    unsafe {
+        handle_extracted_pe(
+            trimmed_data_vec.clone(),
+            output_path,
+            count,
+            header_bytes,
+            file_alignment,
+            valid,
+            pos,
+            abs_offset,
+            headers,
+        )?;
+
+        *buffer = trimmed_data_vec;
+        Ok(())
+    }
 }
 fn process_mz_offsets(
     buffer: &mut Vec<u8>,
@@ -100,11 +117,15 @@ fn process_mz_offsets(
     file: &mut File,
     offset: &mut usize,
     count: &mut u32,
-    headers: &mut HashSet<String>,
+    headers: &mut std::collections::HashSet<String>,
     output_path: &str,
 ) {
+    const NT32_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR32_MAGIC.0;
+    const NT64_MAGIC: u16 = IMAGE_NT_OPTIONAL_HDR64_MAGIC.0;
+
     for pos in mz_offsets {
-        if pos + size_of::<IMAGE_DOS_HEADER>() > buffer.len() {
+        // Check that there are enough bytes for a DOS header.
+        if pos + std::mem::size_of::<IMAGE_DOS_HEADER>() > buffer.len() {
             let message = format!(
                 "Offset 0x{:x} exceeds buffer size at absolute offset 0x{:x}. Skipping...",
                 pos,
@@ -114,315 +135,542 @@ fn process_mz_offsets(
             let _ = crossterm::execute!(
                 std::io::stdout(),
                 SetForegroundColor(Color::Red),
-                Print(message),
+                Print(&message),
                 ResetColor,
                 Print("\n")
             );
             continue;
         }
 
-        let (dos_header, valid) =
-            safe_read::<IMAGE_DOS_HEADER>(&buffer[pos..pos + size_of::<IMAGE_DOS_HEADER>()]);
+        // Read the DOS header.
+        let (dos_header_opt, valid) = safe_read::<IMAGE_DOS_HEADER>(
+            &buffer[pos..pos + std::mem::size_of::<IMAGE_DOS_HEADER>()],
+        );
         if !valid {
-            let message = format!(
-                "Warning: Failed to read IMAGE_DOS_HEADER at position {} (absolute position {}). It may be corrupted, processing.", 
-                pos, 
+            log::warn!(
+                "Warning: Failed to read IMAGE_DOS_HEADER at position {} (absolute offset 0x{:x}).",
+                pos,
                 *offset + pos
             );
-            log::warn!("{}", message);
-            let _ = crossterm::execute!(
-                std::io::stdout(),
-                SetForegroundColor(Color::Red),
-                Print(message),
-                ResetColor,
-                Print("\n")
-            );
             continue;
         }
-
-        let dos_header = match dos_header {
+        let dos_header = match dos_header_opt {
             Some(header) => header,
             None => continue,
         };
 
-        if dos_header.e_magic != 0x5a4d {
+        if dos_header.e_magic != 0x5A4D {
+            // Not a valid MZ header.
             continue;
         }
 
-        let nt_header_pos = pos + dos_header.e_lfanew as usize;
-        if nt_header_pos + size_of::<IMAGE_NT_HEADERS32>() > buffer.len()
-            || nt_header_pos + size_of::<IMAGE_NT_HEADERS64>() > buffer.len()
-        {
-            let needed_size = nt_header_pos
-                + std::cmp::max(
-                    size_of::<IMAGE_NT_HEADERS32>(),
-                    size_of::<IMAGE_NT_HEADERS64>(),
-                );
-            let current_size = buffer.len();
-            if needed_size > current_size {
-                if needed_size > 650 * 1024 * 1024 {
-                    if !validate_and_extract_image(buffer, pos, *offset, needed_size) {
-                        continue;
-                    }
-                } else {
-                    if !read_and_extend_buffer(buffer, file, needed_size, nt_header_pos, *offset) {
-                        continue;
-                    }
-                }
-            }
+        // Candidate start.
+        let candidate_start = pos;
 
-            let mut new_buffer = vec![0; needed_size];
-            new_buffer[..current_size].copy_from_slice(&buffer[..current_size]);
-            let read_bytes = file
-                .read(&mut new_buffer[current_size..])
-                .expect("Failed to read data");
-            if read_bytes < needed_size - current_size {
-                let message = format!("Not enough data to read NT Header at position {} (absolute offset 0x{:x}). It may be corrupted.", nt_header_pos, *offset + nt_header_pos);
-                log::warn!("{}", message);
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    SetForegroundColor(Color::Red),
-                    Print(message),
-                    ResetColor,
-                    Print("\n")
+        // Ensure we have enough data to read the PE header offset.
+        let pe_offset_end = candidate_start + 0x3C + 4;
+        if pe_offset_end > buffer.len() {
+            if !read_and_extend_buffer(buffer, file, pe_offset_end, candidate_start, *offset) {
+                log::error!(
+                    "Failed to extend buffer for candidate starting at 0x{:x}",
+                    candidate_start
                 );
                 continue;
             }
-            *buffer = new_buffer; // Assign the new buffer to the dereferenced mutable reference
+        }
+        let pe_header_offset = u32::from_le_bytes([
+            buffer[candidate_start + 0x3C],
+            buffer[candidate_start + 0x3D],
+            buffer[candidate_start + 0x3E],
+            buffer[candidate_start + 0x3F],
+        ]) as usize;
+        let optional_header_offset = pe_header_offset + 4 + 20;
+
+        // Ensure we have enough data for the image size field.
+        let required_image_size_index = candidate_start + optional_header_offset + 59;
+        if required_image_size_index >= buffer.len() {
+            if !read_and_extend_buffer(
+                buffer,
+                file,
+                required_image_size_index + 1,
+                candidate_start,
+                *offset,
+            ) {
+                log::error!(
+                    "Failed to extend buffer for image size offset for candidate starting at 0x{:x}",
+                    candidate_start
+                );
+                continue;
+            }
+        }
+        let image_size = u32::from_le_bytes([
+            buffer[candidate_start + optional_header_offset + 56],
+            buffer[candidate_start + optional_header_offset + 57],
+            buffer[candidate_start + optional_header_offset + 58],
+            buffer[candidate_start + optional_header_offset + 59],
+        ]) as usize;
+
+        if image_size > 600 * 1024 * 1024 {
+            log::error!(
+                "Candidate image size out of range at candidate starting at 0x{:x}",
+                candidate_start
+            );
+            continue;
         }
 
-        if buffer[nt_header_pos..nt_header_pos + 4] == [0x50, 0x45, 0x00, 0x00] {
-            let (magic_option, valid_magic) = safe_read::<u16>(&buffer[nt_header_pos + 0x18..]);
-            if !valid_magic {
-                let message = format!(
-                    "Failed to read magic at position {}. Skipping...",
-                    nt_header_pos + 0x18
-                );
-                log::warn!("{}", message);
-                let _ = crossterm::execute!(
-                    std::io::stdout(),
-                    SetForegroundColor(Color::Red),
-                    Print(message),
-                    ResetColor,
-                    Print("\n")
+        // Ensure the full candidate image (up to image_size) is in the buffer.
+        if candidate_start + image_size > buffer.len() {
+            if !read_and_extend_buffer(
+                buffer,
+                file,
+                candidate_start + image_size,
+                candidate_start,
+                *offset,
+            ) {
+                log::error!(
+                    "Failed to extend buffer for candidate image starting at 0x{:x}",
+                    candidate_start
                 );
                 continue;
             }
+        }
 
-            let magic = match magic_option {
-                Some(m) => m,
-                None => continue,
-            };
+        // Extract candidate image.
+        let mut candidate_vec = buffer[candidate_start..candidate_start + image_size].to_vec();
+        log::debug!(
+            "Extracted candidate PE image from absolute offset 0x{:x} with size {} bytes",
+            *offset + pos,
+            candidate_vec.len()
+        );
 
-            match magic {
-                IMAGE_NT_OPTIONAL_HDR32_MAGIC => {
-                    let (nt_headers_option, valid_nt_header) =
-                        safe_read::<IMAGE_NT_HEADERS32>(&buffer[nt_header_pos..]);
-                    if !valid_nt_header {
-                        let message = format!("Warning: Failed to read IMAGE_NT_HEADERS32 at position {} (absolute position {}). It may be corrupted.", nt_header_pos, *offset + nt_header_pos);
-                        log::warn!("{}", message);
-                        let _ = crossterm::execute!(
-                            std::io::stdout(),
-                            SetForegroundColor(Color::Red),
-                            Print(message),
-                            ResetColor,
-                            Print("\n")
-                        );
-                        continue;
-                    }
-
-                    let nt_headers = match nt_headers_option {
-                        Some(header) => header,
-                        None => continue,
-                    };
-
-                    process_nt_headers32(
-                        buffer,
-                        nt_headers,
-                        nt_header_pos,
-                        pos,
-                        *offset,
-                        valid_nt_header,
-                        output_path,
-                        count,
-                        headers,
-                    );
-                }
-                IMAGE_NT_OPTIONAL_HDR64_MAGIC => {
-                    let (nt_headers_option, valid_nt_header) =
-                        safe_read::<IMAGE_NT_HEADERS64>(&buffer[nt_header_pos..]);
-                    if !valid_nt_header {
-                        let message = format!("Warning: Failed to read IMAGE_NT_HEADERS64 at position {} (absolute position {}). It may be corrupted.", nt_header_pos, *offset + nt_header_pos);
-                        log::warn!("{}", message);
-                        let _ = crossterm::execute!(
-                            std::io::stdout(),
-                            SetForegroundColor(Color::Red),
-                            Print(message),
-                            ResetColor,
-                            Print("\n")
-                        );
-                        continue;
-                    }
-
-                    let nt_headers = match nt_headers_option {
-                        Some(header) => header,
-                        None => continue,
-                    };
-
-                    process_nt_headers64(
-                        buffer,
-                        nt_headers,
-                        nt_header_pos,
-                        pos,
-                        *offset,
-                        valid_nt_header,
-                        output_path,
-                        count,
-                        headers,
-                    );
-                }
-                _ => {
-                    continue;
-                }
+        // --- New step: Ensure candidate covers at least the headers (SizeOfHeaders) ---
+        let nt_header_pos = dos_header.e_lfanew as usize;
+        if candidate_vec.len() < nt_header_pos + 4 {
+            log::error!(
+                "Candidate too small for NT header at relative offset 0x{:x}",
+                nt_header_pos
+            );
+            continue;
+        }
+        if candidate_vec[nt_header_pos..nt_header_pos + 4] != [0x50, 0x45, 0x00, 0x00] {
+            log::error!(
+                "PE signature not found in candidate at relative offset 0x{:x}",
+                nt_header_pos
+            );
+            continue;
+        }
+        // Read magic value from Optional Header.
+        let magic_offset = nt_header_pos + 4 + std::mem::size_of::<IMAGE_FILE_HEADER>();
+        if candidate_vec.len() < magic_offset + 2 {
+            log::error!("Candidate too small to read Optional Header magic");
+            continue;
+        }
+        let magic = u16::from_le_bytes([candidate_vec[magic_offset], candidate_vec[magic_offset + 1]]);
+        let header_size = if magic == NT32_MAGIC {
+            if candidate_vec.len() < nt_header_pos + size_of::<IMAGE_NT_HEADERS32>() {
+                0
+            } else {
+                let nt_headers = unsafe {
+                    &*(candidate_vec[nt_header_pos..].as_ptr() as *const IMAGE_NT_HEADERS32)
+                };
+                nt_headers.OptionalHeader.SizeOfHeaders as usize
             }
+        } else if magic == NT64_MAGIC {
+            if candidate_vec.len() < nt_header_pos + size_of::<IMAGE_NT_HEADERS64>() {
+                0
+            } else {
+                let nt_headers = unsafe {
+                    &*(candidate_vec[nt_header_pos..].as_ptr() as *const IMAGE_NT_HEADERS64)
+                };
+                nt_headers.OptionalHeader.SizeOfHeaders as usize
+            }
+        } else {
+            0
+        };
+
+        if header_size == 0 {
+            log::error!(
+                "Unable to read SizeOfHeaders from candidate at absolute offset 0x{:x}",
+                *offset + pos
+            );
+            continue;
+        }
+
+        // Extend candidate_vec if necessary so that it covers at least the header region.
+        let required_total = candidate_start + std::cmp::max(image_size, header_size);
+        if required_total > buffer.len() {
+            if !read_and_extend_buffer(buffer, file, required_total, candidate_start, *offset) {
+                log::error!(
+                    "Failed to extend buffer to cover headers for candidate starting at 0x{:x}",
+                    candidate_start
+                );
+                continue;
+            }
+            candidate_vec = buffer[candidate_start..required_total].to_vec();
+        }
+        // --- End new step ---
+
+        // Primary path: validate and extract (which rebuilds the static PE)
+        // NOTE: We now pass header_size as the header_bytes value.
+        if let Err(e) = validate_and_extract_image(
+            &mut candidate_vec.clone(),
+            0,
+            *offset + pos,
+            image_size, // expected image size from header
+            output_path,
+            count,
+            header_size, // pass the actual header size from the Optional Header
+            4096,
+            true,
+            headers,
+        ) {
+            log::error!(
+                "Error validating and extracting image at absolute offset 0x{:x}: {}",
+                *offset + pos,
+                e
+            );
+            // Fallback: try writing the candidate as-is.
+            let header_str = format!("MZ at offset 0x{:x}", *offset + pos);
+            if let Err(err) = write_file(
+                &mut candidate_vec.clone(),
+                Cow::Borrowed(&header_str),
+                image_size,
+                4096,
+                true,
+                0,
+                *offset + pos,
+                output_path,
+                count,
+                headers,
+            ) {
+                log::error!("Fallback write_file failed: {}", err);
+            }
+            // If the primary path failed, continue to NT header processing.
+        } else {
+            log::info!(
+                "Candidate PE validated and extracted at absolute offset 0x{:x}",
+                *offset + pos
+            );
+            // Skip further NT header processing for this candidate.
+            continue;
+        }
+
+        // Fallback path: Process NT headers if validate_and_extract_image fails.
+        if candidate_vec.len() < nt_header_pos + 4 {
+            log::error!(
+                "Candidate too small for NT header at relative offset 0x{:x}",
+                nt_header_pos
+            );
+            continue;
+        }
+        if candidate_vec[nt_header_pos..nt_header_pos + 4] != [0x50, 0x45, 0x00, 0x00] {
+            log::error!(
+                "PE signature not found in candidate at relative offset 0x{:x}",
+                nt_header_pos
+            );
+            continue;
+        }
+        let (magic_opt, valid_magic) = safe_read::<u16>(&candidate_vec[nt_header_pos + 0x18..]);
+        if !valid_magic {
+            log::error!("Failed to read NT header magic from candidate");
+            continue;
+        }
+        let magic = match magic_opt {
+            Some(m) => m,
+            None => continue,
+        };
+
+        match magic {
+            NT32_MAGIC => {
+                process_nt_headers32(
+                    &mut candidate_vec,
+                    file,
+                    nt_header_pos,
+                    0, // candidate now starts at 0
+                    *offset + pos,
+                    output_path,
+                    count,
+                    headers,
+                );
+            }
+            NT64_MAGIC => {
+                process_nt_headers64(
+                    &mut candidate_vec,
+                    file,
+                    nt_header_pos,
+                    0, // candidate now starts at 0
+                    *offset + pos,
+                    output_path,
+                    count,
+                    headers,
+                );
+            }
+            _ => continue,
         }
     }
 }
-fn process_nt_headers64(
-    buffer: &mut Vec<u8>,
-    nt_headers: IMAGE_NT_HEADERS64,
-    _nt_header_pos: usize,
+
+
+
+
+
+
+
+
+
+pub unsafe fn handle_extracted_pe(
+    extracted_pe: Vec<u8>,
+    output_dir: &str, // expected to be a directory path
+    count: &mut u32,
+    header_bytes: usize,
+    file_alignment: usize,
+    valid: bool,
     pos: usize,
     offset: usize,
-    valid_nt_header: bool,
-    output_path: &str,
+    headers: &mut HashSet<String>,
+) -> Result<(), String> {
+    // Build the full output file path.
+    let output_file = format!("{}/extracted_static_{}.exe", output_dir, *count);
+    process_extracted_pe(
+        extracted_pe,
+        &output_file, // pass the full file path here
+        header_bytes,
+        file_alignment,
+        valid,
+        pos,
+        offset,
+        count,
+        headers,
+    )
+}
+
+
+
+
+fn process_nt_headers64(
+    buffer: &mut Vec<u8>,
+    file: &mut File,
+    nt_header_pos: usize,
+    pos: usize,
+    offset: usize,
+    output_dir: &str, // expected to be a directory path
     count: &mut u32,
     headers: &mut HashSet<String>,
 ) {
-    let file_alignment = nt_headers.OptionalHeader.FileAlignment as usize;
+    log::debug!(
+        "(64-bit) Buffer length before NT header reading: {}. nt_header_pos: {}, required: {}",
+        buffer.len(),
+        nt_header_pos,
+        nt_header_pos + std::mem::size_of::<IMAGE_NT_HEADERS64>()
+    );
+    if buffer.len() < nt_header_pos + std::mem::size_of::<IMAGE_NT_HEADERS64>() {
+        log::warn!(
+            "Buffer length {} is less than expected for IMAGE_NT_HEADERS64 ({}). Attempting to extend...",
+            buffer.len(),
+            nt_header_pos + std::mem::size_of::<IMAGE_NT_HEADERS64>()
+        );
+        if !read_and_extend_buffer(buffer, file, nt_header_pos + std::mem::size_of::<IMAGE_NT_HEADERS64>(), pos, offset) {
+            log::error!(
+                "Failed to extend candidate buffer for NT header reading at absolute offset 0x{:x}",
+                offset
+            );
+            return;
+        }
+        log::debug!("Buffer length after extension: {}", buffer.len());
+    }
+    let (nt_headers_opt, valid_nt_header) =
+        safe_read::<IMAGE_NT_HEADERS64>(&buffer[nt_header_pos..]);
+    if !valid_nt_header {
+        log::error!(
+            "Failed to read IMAGE_NT_HEADERS64 from candidate at relative offset 0x{:x}",
+            nt_header_pos
+        );
+        return;
+    }
+    let nt_headers = match nt_headers_opt {
+        Some(h) => h,
+        None => return,
+    };
 
     let header_end = pos + nt_headers.OptionalHeader.SizeOfHeaders as usize;
-    if header_end < pos {
-        println!("Invalid header end. Skipping...");
-        return;
-    }
-
+    log::debug!(
+        "(64-bit) Expected header_end: {}. Current buffer length: {}",
+        header_end,
+        buffer.len()
+    );
     if header_end > buffer.len() {
-        let upper_bound = std::cmp::min(
+        log::warn!(
+            "Buffer length {} is less than expected header_end {}. Attempting to extend...",
             buffer.len(),
-            pos + nt_headers.OptionalHeader.SizeOfImage as usize,
+            header_end
         );
-        let mut new_buffer = vec![0; upper_bound - pos];
-        new_buffer.copy_from_slice(&buffer[pos..upper_bound]);
-
-        let remaining_upper_bound = std::cmp::min(buffer.len(), header_end);
-        let remaining_data = &buffer[remaining_upper_bound..];
-
-        new_buffer.extend_from_slice(remaining_data);
-
-        *buffer = new_buffer;
+        if !read_and_extend_buffer(buffer, file, header_end, pos, offset) {
+            log::error!(
+                "Failed to extend candidate buffer for header extraction at absolute offset 0x{:x}",
+                offset
+            );
+            return;
+        }
+        log::debug!("Buffer length after extension: {}", buffer.len());
     }
 
-    let header_str_bound = std::cmp::min(buffer.len(), header_end);
-    if pos >= header_str_bound {
-        let message = format!("Invalid string range at position {} (absolute position {}). Skipping...", pos, offset + pos);
-        log::warn!("{}", message);
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            SetForegroundColor(Color::Red),
-            Print(message),
-            ResetColor,
-            Print("\n")
-        );
-        return;
-    }
-
-    let header_str = std::string::String::from_utf8_lossy(&buffer[pos..header_str_bound]);
-    let header_str_owned = header_str.to_string();
-
-    write_file(
-        buffer,
-        Cow::Borrowed(&header_str_owned),
-        nt_headers.OptionalHeader.SizeOfImage as usize,
-        file_alignment,
-        valid_nt_header, // Propagate the validity flag
+    let header_str = String::from_utf8_lossy(&buffer[pos..header_end]);
+    log::info!(
+        "Processing 64-bit NT headers at pos 0x{:x} (absolute offset 0x{:x}). Header length: {}. Buffer length: {}. Header:\n{}",
         pos,
         offset + pos,
-        output_path,
+        header_end - pos,
+        buffer.len(),
+        header_str
+    );
+
+    // Build full output file path from output_dir.
+    let output_file = format!("{}/extracted_static_{}.exe", output_dir, *count);
+    let out_path = Path::new(&output_file);
+    if let Some(parent) = out_path.parent() {
+        log::debug!("Output file parent directory: {}", parent.display());
+        if let Err(e) = fs::create_dir_all(parent) {
+            log::error!("Failed to create output directory {}: {}", parent.display(), e);
+            return;
+        }
+    } else {
+        log::error!("Failed to determine parent directory of output file: {}", output_file);
+        return;
+    }
+
+    if let Err(e) = process_extracted_pe(
+        buffer.clone(),
+        &output_file,
+        nt_headers.OptionalHeader.SizeOfImage as usize,
+        nt_headers.OptionalHeader.FileAlignment as usize,
+        valid_nt_header,
+        pos,
+        offset + pos,
         count,
         headers,
-    );
+    ) {
+        log::error!(
+            "Error processing 64-bit NT headers. Output file: {}. Error: {}",
+            output_file,
+            e
+        );
+    }
 }
 
 fn process_nt_headers32(
     buffer: &mut Vec<u8>,
-    nt_headers: IMAGE_NT_HEADERS32,
-    _nt_header_pos: usize,
+    file: &mut File,
+    nt_header_pos: usize,
     pos: usize,
     offset: usize,
-    valid_nt_header: bool,
-    output_path: &str,
+    output_dir: &str, // expected to be a directory path
     count: &mut u32,
     headers: &mut HashSet<String>,
 ) {
-    let file_alignment = nt_headers.OptionalHeader.FileAlignment as usize;
+    log::debug!(
+        "(32-bit) Buffer length before NT header reading: {}. nt_header_pos: {}, required: {}",
+        buffer.len(),
+        nt_header_pos,
+        nt_header_pos + std::mem::size_of::<IMAGE_NT_HEADERS32>()
+    );
+    if buffer.len() < nt_header_pos + std::mem::size_of::<IMAGE_NT_HEADERS32>() {
+        log::warn!(
+            "Buffer length {} is less than expected for IMAGE_NT_HEADERS32 ({}). Attempting to extend...",
+            buffer.len(),
+            nt_header_pos + std::mem::size_of::<IMAGE_NT_HEADERS32>()
+        );
+        if !read_and_extend_buffer(buffer, file, nt_header_pos + std::mem::size_of::<IMAGE_NT_HEADERS32>(), pos, offset) {
+            log::error!(
+                "Failed to extend candidate buffer for NT header reading at absolute offset 0x{:x}",
+                offset
+            );
+            return;
+        }
+        log::debug!("Buffer length after extension: {}", buffer.len());
+    }
+    let (nt_headers_opt, valid_nt_header) =
+        safe_read::<IMAGE_NT_HEADERS32>(&buffer[nt_header_pos..]);
+    if !valid_nt_header {
+        log::error!(
+            "Failed to read IMAGE_NT_HEADERS32 from candidate at relative offset 0x{:x}",
+            nt_header_pos
+        );
+        return;
+    }
+    let nt_headers = match nt_headers_opt {
+        Some(h) => h,
+        None => return,
+    };
 
     let header_end = pos + nt_headers.OptionalHeader.SizeOfHeaders as usize;
-    if header_end < pos {
-        println!("Invalid header end. Skipping...");
-        return;
-    }
-
+    log::debug!(
+        "(32-bit) Expected header_end: {}. Current buffer length: {}",
+        header_end,
+        buffer.len()
+    );
     if header_end > buffer.len() {
-        let upper_bound = std::cmp::min(
+        log::warn!(
+            "Buffer length {} is less than expected header_end {}. Attempting to extend...",
             buffer.len(),
-            pos + nt_headers.OptionalHeader.SizeOfImage as usize,
+            header_end
         );
-        let mut new_buffer = vec![0; upper_bound - pos];
-        new_buffer.copy_from_slice(&buffer[pos..upper_bound]);
-
-        let remaining_upper_bound = std::cmp::min(buffer.len(), header_end);
-        let remaining_data = &buffer[remaining_upper_bound..];
-
-        new_buffer.extend_from_slice(remaining_data);
-
-        *buffer = new_buffer;
+        if !read_and_extend_buffer(buffer, file, header_end, pos, offset) {
+            log::error!(
+                "Failed to extend candidate buffer for header extraction at absolute offset 0x{:x}",
+                offset
+            );
+            return;
+        }
+        log::debug!("Buffer length after extension: {}", buffer.len());
     }
 
-    let header_str_bound = std::cmp::min(buffer.len(), header_end);
-    if pos >= header_str_bound {
-        let message = format!("Invalid string range at position {} (absolute position {}). Skipping...", pos, offset + pos);
-        log::warn!("{}", message);
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            SetForegroundColor(Color::Red),
-            Print(message),
-            ResetColor,
-            Print("\n")
-        );
-        return;
-    }
-
-    let header_str = std::string::String::from_utf8_lossy(&buffer[pos..header_str_bound]);
-    let header_str_owned = header_str.to_string();
-
-    write_file(
-        buffer,
-        Cow::Borrowed(&header_str_owned),
-        nt_headers.OptionalHeader.SizeOfImage as usize,
-        file_alignment,
-        valid_nt_header, // Propagate the validity flag
+    let header_str = String::from_utf8_lossy(&buffer[pos..header_end]);
+    log::info!(
+        "Processing 32-bit NT headers at pos 0x{:x} (absolute offset 0x{:x}). Header length: {}. Buffer length: {}. Header:\n{}",
         pos,
         offset + pos,
-        output_path,
+        header_end - pos,
+        buffer.len(),
+        header_str
+    );
+
+    // Build full output file path from output_dir.
+    let output_file = format!("{}/extracted_static_{}.exe", output_dir, *count);
+    let out_path = Path::new(&output_file);
+    if let Some(parent) = out_path.parent() {
+        log::debug!("Output file parent directory: {}", parent.display());
+        if let Err(e) = fs::create_dir_all(parent) {
+            log::error!("Failed to create output directory {}: {}", parent.display(), e);
+            return;
+        }
+    } else {
+        log::error!("Failed to determine parent directory of output file: {}", output_file);
+        return;
+    }
+
+    if let Err(e) = process_extracted_pe(
+        buffer.clone(),
+        &output_file,
+        nt_headers.OptionalHeader.SizeOfImage as usize,
+        nt_headers.OptionalHeader.FileAlignment as usize,
+        valid_nt_header,
+        pos,
+        offset + pos,
         count,
         headers,
-    );
+    ) {
+        log::error!(
+            "Error processing 32-bit NT headers. Output file: {}. Error: {}",
+            output_file,
+            e
+        );
+    }
 }
+
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-
     if args.len() != 3 {
         println!("Usage: {} <input_file> <output_dir>", args[0]);
         return;
@@ -436,25 +684,28 @@ fn main() {
         return;
     }
 
-    if let Ok(metadata) = fs::metadata(output_path) {
+    if let Ok(metadata) = std::fs::metadata(output_path) {
         if !metadata.is_dir() {
             println!("Output path is not a directory: {}", output_path);
             return;
         }
     } else {
-        fs::create_dir_all(output_path).expect("Failed to create output directory");
+        std::fs::create_dir_all(output_path).expect("Failed to create output directory");
     }
-    let log_config = ConfigBuilder::new().set_time_to_local(true).build();
 
+    let log_config = simplelog::ConfigBuilder::new()
+        .set_time_to_local(true)
+        .build();
     let log_dir = "./logs";
-    fs::create_dir_all(log_dir).expect("Failed to create directories");
-
-    // Create log file
+    std::fs::create_dir_all(log_dir).expect("Failed to create directories");
     let log_file_path = format!("{}/app.log", log_dir);
-    let log_file = File::create(&log_file_path).expect("Failed to create log file");
+    let log_file = std::fs::File::create(&log_file_path).expect("Failed to create log file");
+    simplelog::WriteLogger::init(simplelog::LevelFilter::Info, log_config, log_file).unwrap();
 
-    
+    log::info!("Starting extraction...");
 
-    WriteLogger::init(LevelFilter::Info, log_config, log_file).unwrap();
+    // Call extract_executables directly:
     extract_executables(input_path, output_path);
+
+    log::info!("Extraction completed successfully.");
 }
