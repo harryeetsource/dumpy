@@ -1,282 +1,222 @@
-use crate::*;
-use std::error::Error;
-use std::mem::size_of;
-use std::path::Path;
-use std::cmp;
+use std::cmp::max;
 
-/// Rebuilds (unmaps) a PE image from its in‑memory (virtual) layout into its static (raw) layout.
-/// It returns a new Vec<u8> containing the PE as it should appear on disk.
-/// Works for both 32‑bit and 64‑bit images.
-pub fn rebuild_static_pe(buffer: &[u8], required_header_bytes: usize) -> Option<Vec<u8>> {
-    // Check DOS header.
-    if buffer.len() < size_of::<IMAGE_DOS_HEADER>() {
-        log::error!("Buffer length {} less than size of IMAGE_DOS_HEADER", buffer.len());
-        return None;
-    }
-    let dos_header = unsafe { &*(buffer.as_ptr() as *const IMAGE_DOS_HEADER) };
-    if dos_header.e_magic != 0x5A4D {
-        log::error!("Invalid DOS header magic: 0x{:x}", dos_header.e_magic);
-        return None;
-    }
-    let nt_offset = dos_header.e_lfanew as usize;
-    if buffer.len() < nt_offset + 4 {
-        log::error!("Buffer length {} less than nt_offset + 4 ({})", buffer.len(), nt_offset+4);
-        return None;
-    }
-    if &buffer[nt_offset..nt_offset + 4] != b"PE\0\0" {
-        log::error!("PE signature not found at nt_offset {}", nt_offset);
-        return None;
-    }
+pub const MAX_IMAGE: usize = 600 * 1024 * 1024;
+const MAX_SECTIONS: usize = 96;
 
-    // Determine if 32-bit or 64-bit.
-    let magic_offset = nt_offset + 4 + size_of::<IMAGE_FILE_HEADER>();
-    if buffer.len() < magic_offset + 2 {
-        log::error!("Buffer too small to read Optional Header magic");
-        return None;
-    }
-    let magic = u16::from_le_bytes([buffer[magic_offset], buffer[magic_offset + 1]]);
-    
-    let (headers_size, num_sections, section_table_offset): (usize, usize, usize);
-    let mut sections = Vec::new();
-    if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC.0 {
-        if buffer.len() < nt_offset + size_of::<IMAGE_NT_HEADERS32>() {
-            log::error!("Buffer too small for IMAGE_NT_HEADERS32");
-            return None;
-        }
-        let nt_headers = unsafe { &*(buffer[nt_offset..].as_ptr() as *const IMAGE_NT_HEADERS32) };
-        headers_size = nt_headers.OptionalHeader.SizeOfHeaders as usize;
-        num_sections = nt_headers.FileHeader.NumberOfSections as usize;
-        section_table_offset = nt_offset + size_of::<IMAGE_NT_HEADERS32>();
-    } else if magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC.0 {
-        if buffer.len() < nt_offset + size_of::<IMAGE_NT_HEADERS64>() {
-            log::error!("Buffer too small for IMAGE_NT_HEADERS64");
-            return None;
-        }
-        let nt_headers = unsafe { &*(buffer[nt_offset..].as_ptr() as *const IMAGE_NT_HEADERS64) };
-        headers_size = nt_headers.OptionalHeader.SizeOfHeaders as usize;
-        num_sections = nt_headers.FileHeader.NumberOfSections as usize;
-        section_table_offset = nt_offset + size_of::<IMAGE_NT_HEADERS64>();
-    } else {
-        log::error!("Unknown Optional Header magic: 0x{:x}", magic);
-        return None;
-    }
-
-    // Compute file size from header and section raw offsets.
-    let mut file_size = headers_size;
-    for i in 0..num_sections {
-        let sec_offset = section_table_offset + i * size_of::<IMAGE_SECTION_HEADER>();
-        if buffer.len() < sec_offset + size_of::<IMAGE_SECTION_HEADER>() {
-            log::error!("Buffer too small for section header {} at offset {}", i, sec_offset);
-            return None;
-        }
-        let section = unsafe { &*(buffer[sec_offset..].as_ptr() as *const IMAGE_SECTION_HEADER) };
-        sections.push(*section);
-        let sec_end = section.PointerToRawData as usize + section.SizeOfRawData as usize;
-        file_size = cmp::max(file_size, sec_end);
-    }
-    let new_file_size = cmp::max(file_size, required_header_bytes);
-    log::debug!("Rebuild static PE: headers_size: {}, file_size from sections: {}, required_header_bytes: {}, new_file_size: {}",
-        headers_size, file_size, required_header_bytes, new_file_size);
-
-    let mut new_buffer = vec![0u8; new_file_size];
-
-    // Copy header region.
-    if buffer.len() < headers_size {
-        log::error!("Buffer too small for headers: {} vs {}", buffer.len(), headers_size);
-        return None;
-    }
-    new_buffer[..headers_size].copy_from_slice(&buffer[..headers_size]);
-
-    // Copy each section's raw data.
-    for section in &sections {
-        unsafe {
-            let raw_offset = section.PointerToRawData as usize;
-            let raw_size = section.SizeOfRawData as usize;
-            let virt_addr = section.VirtualAddress as usize;
-            // Use the larger of VirtualSize and SizeOfRawData.
-            let virt_size = cmp::max(section.Misc.VirtualSize as usize, raw_size);
-            let copy_size = cmp::min(raw_size, virt_size);
-            if virt_addr + copy_size <= buffer.len() && raw_offset + copy_size <= new_buffer.len() {
-                new_buffer[raw_offset..raw_offset + copy_size]
-                    .copy_from_slice(&buffer[virt_addr..virt_addr + copy_size]);
-            } else {
-                log::warn!("Section copy skipped: virt_addr {} + copy_size {} exceeds buffer length {} or raw_offset {} + copy_size {} exceeds new_buffer length {}",
-                    virt_addr, copy_size, buffer.len(), raw_offset, copy_size, new_buffer.len());
-            }
-        }
-    }
-
-    // Rebuild the Import Directory.
-    let import_dir = if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC.0 {
-        let nt_headers = unsafe { &*(buffer[nt_offset..].as_ptr() as *const IMAGE_NT_HEADERS32) };
-        nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT.0 as usize]
-    } else {
-        let nt_headers = unsafe { &*(buffer[nt_offset..].as_ptr() as *const IMAGE_NT_HEADERS64) };
-        nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT.0 as usize]
-    };
-
-    if import_dir.VirtualAddress != 0 && import_dir.Size != 0 {
-        if let Some(import_raw_offset) = rva_to_raw(import_dir.VirtualAddress, &sections) {
-            let mut descriptor_offset = import_raw_offset as usize;
-            while descriptor_offset + size_of::<IMAGE_IMPORT_DESCRIPTOR>() <= new_buffer.len() {
-                let descriptor: &mut IMAGE_IMPORT_DESCRIPTOR = unsafe {
-                    &mut *(new_buffer[descriptor_offset..].as_mut_ptr() as *mut IMAGE_IMPORT_DESCRIPTOR)
-                };
-                if descriptor.Name == 0 &&
-                   unsafe {descriptor.Anonymous.OriginalFirstThunk} == 0 &&
-                   descriptor.FirstThunk == 0 {
-                    break;
-                }
-                if descriptor.Name != 0 {
-                    if let Some(name_raw) = rva_to_raw(descriptor.Name, &sections) {
-                        descriptor.Name = name_raw;
-                    } else {
-                        log::error!("Failed to remap DLL name RVA at descriptor offset 0x{:x}", descriptor_offset);
-                        break;
-                    }
-                }
-                if unsafe{descriptor.Anonymous.OriginalFirstThunk} != 0 {
-                    if let Some(ofthunk_raw) = rva_to_raw(unsafe{descriptor.Anonymous.OriginalFirstThunk}, &sections) {
-                        descriptor.Anonymous.OriginalFirstThunk = ofthunk_raw;
-                    } else {
-                        log::error!("Failed to remap OriginalFirstThunk RVA at descriptor offset 0x{:x}", descriptor_offset);
-                    }
-                }
-                if descriptor.FirstThunk != 0 {
-                    if let Some(thunk_raw) = rva_to_raw(descriptor.FirstThunk, &sections) {
-                        descriptor.FirstThunk = thunk_raw;
-                    } else {
-                        log::error!("Failed to remap FirstThunk RVA at descriptor offset 0x{:x}", descriptor_offset);
-                    }
-                }
-                descriptor_offset += size_of::<IMAGE_IMPORT_DESCRIPTOR>();
-            }
-        } else {
-            log::error!("Failed to map import directory RVA to raw offset");
-        }
-    }
-
-    // Rebuild the Export Directory, if present.
-    let export_dir = if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC.0 {
-        let nt_headers = unsafe { &*(buffer[nt_offset..].as_ptr() as *const IMAGE_NT_HEADERS32) };
-        nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT.0 as usize]
-    } else {
-        let nt_headers = unsafe { &*(buffer[nt_offset..].as_ptr() as *const IMAGE_NT_HEADERS64) };
-        nt_headers.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT.0 as usize]
-    };
-
-    if export_dir.VirtualAddress != 0 && export_dir.Size != 0 {
-        if let Some(export_raw_offset) = rva_to_raw(export_dir.VirtualAddress, &sections) {
-            if export_raw_offset as usize + size_of::<IMAGE_EXPORT_DIRECTORY>() <= new_buffer.len() {
-                let export_dir_struct = unsafe {
-                    &mut *(new_buffer[export_raw_offset as usize..].as_mut_ptr() as *mut IMAGE_EXPORT_DIRECTORY)
-                };
-                if export_dir_struct.Name != 0 {
-                    if let Some(name_raw) = rva_to_raw(export_dir_struct.Name, &sections) {
-                        export_dir_struct.Name = name_raw;
-                    } else {
-                        log::error!("Failed to remap export directory Name RVA");
-                    }
-                }
-                if export_dir_struct.AddressOfFunctions != 0 {
-                    if let Some(func_raw) = rva_to_raw(export_dir_struct.AddressOfFunctions, &sections) {
-                        export_dir_struct.AddressOfFunctions = func_raw;
-                    } else {
-                        log::error!("Failed to remap AddressOfFunctions RVA");
-                    }
-                }
-                if export_dir_struct.AddressOfNames != 0 {
-                    if let Some(names_raw) = rva_to_raw(export_dir_struct.AddressOfNames, &sections) {
-                        export_dir_struct.AddressOfNames = names_raw;
-                    } else {
-                        log::error!("Failed to remap AddressOfNames RVA");
-                    }
-                }
-                if export_dir_struct.AddressOfNameOrdinals != 0 {
-                    if let Some(ordinals_raw) = rva_to_raw(export_dir_struct.AddressOfNameOrdinals, &sections) {
-                        export_dir_struct.AddressOfNameOrdinals = ordinals_raw;
-                    } else {
-                        log::error!("Failed to remap AddressOfNameOrdinals RVA");
-                    }
-                }
-            } else {
-                log::error!("Export directory structure exceeds new buffer length");
-            }
-        } else {
-            log::error!("Failed to map export directory RVA to raw offset");
-        }
-    }
-
-    Some(new_buffer)
+fn u16_at(b: &[u8], o: usize) -> Option<u16> {
+    let a: [u8; 2] = b.get(o..o.checked_add(2)?)?.try_into().ok()?;
+    Some(u16::from_le_bytes(a))
+}
+fn u32_at(b: &[u8], o: usize) -> Option<u32> {
+    let a: [u8; 4] = b.get(o..o.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(a))
 }
 
-/// Converts an RVA to a raw offset using section headers.
-fn rva_to_raw(rva: u32, sections: &[IMAGE_SECTION_HEADER]) -> Option<u32> {
-    unsafe {
-        for section in sections {
-            let start = section.VirtualAddress;
-            // Use the larger of VirtualSize and SizeOfRawData.
-            let size = cmp::max(section.Misc.VirtualSize as u32, section.SizeOfRawData);
-            if rva >= start && rva < start + size {
-                return Some(rva - start + section.PointerToRawData);
-            }
-        }
-    }
-    None
+#[derive(Debug, Clone)]
+pub struct Section {
+    pub name: String,
+    pub virtual_address: usize,
+    pub virtual_size: usize,
+    pub raw_offset: usize,
+    pub raw_size: usize,
+    pub characteristics: u32,
 }
 
-/// Processes the extracted PE by writing the rebuilt static image to disk.
-/// output_path is now the full file path, e.g. "C:/Users/kernel/Desktop/e/extracted_static_1.exe"
-pub fn process_extracted_pe(
-    image_buffer: Vec<u8>,
-    output_path: &str,
-    header_bytes: usize,
-    file_alignment: usize,
-    valid: bool,
-    pos: usize,
-    offset: usize,
-    count: &mut u32,
-    headers: &mut HashSet<String>,
-) -> Result<(), String> {
-    if let Some(mut static_image) = rebuild_static_pe(&image_buffer, header_bytes) {
-        log::debug!("Static image rebuilt; length: {}", static_image.len());
-        let header_slice = static_image
-            .get(0..header_bytes)
-            .ok_or(format!(
-                "Buffer too small for header extraction: requested {}, but static image length is {}",
-                header_bytes,
-                static_image.len()
-            ))?
-            .to_vec();
-        let header_str = String::from_utf8_lossy(&header_slice).to_string();
+#[derive(Debug)]
+pub struct Pe {
+    pub is_64: bool,
+    pub size_of_image: usize,
+    pub headers_size: usize,
+    pub raw_file_size: usize,
+    pub sections: Vec<Section>,
+    pub import: (u32, u32),
+    pub export: (u32, u32),
+}
 
-        // Ensure the parent directory exists.
-        let out_path = Path::new(output_path);
-        if let Some(parent) = out_path.parent() {
-            log::debug!("Output file parent directory: {}", parent.display());
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create output directory {}: {}", parent.display(), e))?;
-        } else {
-            return Err(format!("Failed to determine parent directory of output file: {}", output_path));
+impl Pe {
+    pub fn parse(b: &[u8]) -> Result<Self, String> {
+        if b.get(..2) != Some(b"MZ") { return Err("missing MZ".into()); }
+        let nt = usize::try_from(u32_at(b, 0x3c).ok_or("short DOS header")?)
+            .map_err(|_| "invalid e_lfanew")?;
+        if nt < 0x40 || nt > 1024 * 1024 || b.get(nt..nt.checked_add(4).ok_or("NT overflow")?) != Some(b"PE\0\0") {
+            return Err("invalid PE signature or e_lfanew".into());
         }
-        log::debug!("Writing static PE to output file: {}", output_path);
-        write_file(
-            &mut static_image,
-            Cow::Borrowed(&header_str),
-            header_bytes,
-            file_alignment,
-            valid,
-            pos,
-            offset,
-            output_path,
-            count,
-            headers,
-        )
-        .map_err(|e| format!("Failed to write static PE file ({}): {}", output_path, e))?;
-
-        println!("Successfully rebuilt static PE: {}", output_path);
-        Ok(())
-    } else {
-        Err("Failed to rebuild static PE from the extracted image.".into())
+        let coff = nt + 4;
+        let count = u16_at(b, coff + 2).ok_or("short COFF header")? as usize;
+        if count == 0 || count > MAX_SECTIONS { return Err("invalid section count".into()); }
+        let opt_size = u16_at(b, coff + 16).ok_or("short COFF header")? as usize;
+        let opt = coff + 20;
+        let opt_end = opt.checked_add(opt_size).ok_or("optional header overflow")?;
+        b.get(opt..opt_end).ok_or("truncated optional header")?;
+        let magic = u16_at(b, opt).ok_or("missing optional header")?;
+        let (is_64, min_opt, dir_start, dir_count_offset) = match magic {
+            0x10b => (false, 96, 96, 92),
+            0x20b => (true, 112, 112, 108),
+            _ => return Err("unknown optional header magic".into()),
+        };
+        if opt_size < min_opt { return Err("short optional header".into()); }
+        let size_of_image = u32_at(b, opt + 56).ok_or("missing SizeOfImage")? as usize;
+        let headers_size = u32_at(b, opt + 60).ok_or("missing SizeOfHeaders")? as usize;
+        let section_alignment = u32_at(b, opt + 32).ok_or("missing SectionAlignment")?;
+        let file_alignment = u32_at(b, opt + 36).ok_or("missing FileAlignment")?;
+        if size_of_image == 0 || size_of_image > MAX_IMAGE || headers_size < opt_end || headers_size > size_of_image
+            || section_alignment == 0 || file_alignment == 0 {
+            return Err("invalid image size, headers size, or alignment".into());
+        }
+        let table_end = opt_end.checked_add(count.checked_mul(40).ok_or("section count overflow")?)
+            .ok_or("section table overflow")?;
+        if table_end > headers_size { return Err("section table exceeds SizeOfHeaders".into()); }
+        b.get(..headers_size).ok_or("truncated headers")?;
+        let dirs = u32_at(b, opt + dir_count_offset).ok_or("missing directory count")? as usize;
+        let directory = |i: usize| -> (u32, u32) {
+            if i >= dirs || dir_start + (i + 1) * 8 > opt_size { return (0, 0); }
+            (u32_at(b, opt + dir_start + i * 8).unwrap_or(0),
+             u32_at(b, opt + dir_start + i * 8 + 4).unwrap_or(0))
+        };
+        let mut sections = Vec::with_capacity(count);
+        let mut raw_file_size = headers_size;
+        for i in 0..count {
+            let off = opt_end + i * 40;
+            let name_bytes = b.get(off..off + 8).ok_or("short section name")?;
+            let name_end = name_bytes.iter().position(|v| *v == 0).unwrap_or(8);
+            let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
+            let virtual_size = u32_at(b, off + 8).ok_or("short section")? as usize;
+            let virtual_address = u32_at(b, off + 12).ok_or("short section")? as usize;
+            let raw_size = u32_at(b, off + 16).ok_or("short section")? as usize;
+            let raw_offset = u32_at(b, off + 20).ok_or("short section")? as usize;
+            if raw_size != 0 {
+                let raw_end = raw_offset.checked_add(raw_size).ok_or("raw size overflow")?;
+                if raw_offset < headers_size || raw_end > MAX_IMAGE { return Err("invalid raw section range".into()); }
+                raw_file_size = max(raw_file_size, raw_end);
+            }
+            let virtual_end = virtual_address.checked_add(max(virtual_size, raw_size)).ok_or("virtual size overflow")?;
+            if virtual_end > size_of_image.saturating_add(section_alignment as usize) {
+                return Err("virtual section exceeds image".into());
+            }
+            let characteristics = u32_at(b, off + 36).ok_or("short section flags")?;
+            sections.push(Section { name, virtual_address, virtual_size, raw_offset, raw_size,
+                characteristics });
+        }
+        Ok(Self { is_64, size_of_image, headers_size, raw_file_size, sections,
+            import: directory(1), export: directory(0) })
     }
+
+    pub fn rva_to_raw(&self, rva: u32) -> Option<usize> {
+        let r = rva as usize;
+        if r < self.headers_size { return Some(r); }
+        self.sections.iter().find_map(|s| {
+            let delta = r.checked_sub(s.virtual_address)?;
+            if delta < s.raw_size && delta < max(s.virtual_size, s.raw_size) {
+                s.raw_offset.checked_add(delta)
+            } else { None }
+        })
+    }
+
+    pub fn rva_to_mapped(&self, rva: u32) -> Option<usize> {
+        let r = rva as usize;
+        if r < self.size_of_image { Some(r) } else { None }
+    }
+
+    fn directory_score(&self, b: &[u8], mapped: bool) -> usize {
+        let mut score = 0;
+        for (rva, size, minimum) in [(self.import.0, self.import.1, 20usize), (self.export.0, self.export.1, 40usize)] {
+            if rva == 0 || size == 0 { continue; }
+            let off = if mapped { self.rva_to_mapped(rva) } else { self.rva_to_raw(rva) };
+            if off.and_then(|o| b.get(o..o.checked_add(minimum)?)).is_some() { score += 1; }
+        }
+        score
+    }
+
+    pub fn recover(&self, image: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
+        let raw_possible = image.len() >= self.raw_file_size;
+        let mapped_possible = image.len() >= self.size_of_image && self.sections.iter().all(|s| {
+            s.raw_size == 0 || s.virtual_address.checked_add(s.raw_size).is_some_and(|end| end <= image.len())
+        });
+        if !raw_possible && !mapped_possible { return Err("incomplete raw and mapped image".into()); }
+        // Prefer raw when both layouts are plausible: it preserves overlays and original directory bytes.
+        let raw_score = if raw_possible { self.directory_score(image, false) } else { 0 };
+        let mapped_score = if mapped_possible { self.directory_score(image, true) } else { 0 };
+        if raw_possible && (raw_score >= mapped_score || !mapped_possible) {
+            return Ok((image[..self.raw_file_size].to_vec(), "raw"));
+        }
+        Ok((self.recover_mapped(image)?, "mapped"))
+    }
+
+    pub fn recover_mapped(&self, image: &[u8]) -> Result<Vec<u8>, String> {
+        if image.len() < self.size_of_image { return Err("truncated mapped image".into()); }
+        let mut result = vec![0; self.raw_file_size];
+        result[..self.headers_size].copy_from_slice(&image[..self.headers_size]);
+        for s in &self.sections {
+            if s.raw_size == 0 { continue; }
+            let source = image.get(s.virtual_address..s.virtual_address + s.raw_size)
+                .ok_or("truncated mapped section")?;
+            let destination = result.get_mut(s.raw_offset..s.raw_offset + s.raw_size)
+                .ok_or("invalid destination section")?;
+            destination.copy_from_slice(source);
+        }
+        // Import/export directory entries and their internal pointers are RVAs, not file offsets.
+        // They must not be rewritten when converting mapped section bytes to raw layout.
+        Ok(result)
+    }
+
+    pub fn directory_report(&self, b: &[u8]) -> String {
+        let mut report = Vec::new();
+        for (label, (rva, size), needed) in [("imports", self.import, 20usize), ("exports", self.export, 40usize)] {
+            if rva == 0 || size == 0 { report.push(format!("{label}=absent")); continue; }
+            let valid = self.rva_to_raw(rva).and_then(|o| b.get(o..o.checked_add(needed)?)).is_some();
+            // Basic structural validation: directory pointers must resolve as RVAs.
+            let details_valid = match label {
+                "imports" if valid => self.validate_import_descriptors(b),
+                "exports" if valid => self.validate_export_directory(b),
+                _ => valid,
+            };
+            report.push(format!("{label}={}", if details_valid { "present" } else { "damaged/unmapped" }));
+        }
+        report.join(", ")
+    }
+
+    fn validate_import_descriptors(&self, b: &[u8]) -> bool {
+        let Some(base) = self.rva_to_raw(self.import.0) else { return false };
+        let count = ((self.import.1 as usize) / 20).min(4096);
+        if count == 0 { return false; }
+        for i in 0..count {
+            let Some(off) = i.checked_mul(20).and_then(|n| base.checked_add(n)) else { return false };
+            let (Some(original_thunk), Some(name), Some(first_thunk)) =
+                (u32_at(b, off), u32_at(b, off + 12), u32_at(b, off + 16)) else { return false };
+            if original_thunk == 0 && name == 0 && first_thunk == 0 { return true; }
+            if name == 0 || self.rva_to_raw(name).and_then(|p| b.get(p)).is_none() { return false; }
+            let thunk = if original_thunk != 0 { original_thunk } else { first_thunk };
+            if thunk == 0 || self.rva_to_raw(thunk).and_then(|p| b.get(p)).is_none() { return false; }
+        }
+        false
+    }
+
+    fn validate_export_directory(&self, b: &[u8]) -> bool {
+        let Some(off) = self.rva_to_raw(self.export.0) else { return false };
+        let (Some(name), Some(function_count), Some(name_count), Some(functions), Some(names), Some(ordinals)) =
+            (u32_at(b, off + 12), u32_at(b, off + 20), u32_at(b, off + 24),
+             u32_at(b, off + 28), u32_at(b, off + 32), u32_at(b, off + 36)) else { return false };
+        let table_ok = |rva: u32, count: u32, stride: usize| -> bool {
+            if count == 0 { return true; }
+            if count as usize > 1_000_000 { return false; }
+            self.rva_to_raw(rva).and_then(|p| p.checked_add((count as usize).checked_mul(stride)?).and_then(|end| b.get(p..end))).is_some()
+        };
+        name != 0 && self.rva_to_raw(name).and_then(|p| b.get(p)).is_some()
+            && name_count <= function_count && table_ok(functions, function_count, 4)
+            && table_ok(names, name_count, 4) && table_ok(ordinals, name_count, 2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rejects_negative_e_lfanew() {
+        let mut b = [0u8; 128];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Pe::parse(&b).is_err());
+    }
+    #[test]
+    fn rejects_truncated_input() { assert!(Pe::parse(b"MZ").is_err()); }
 }
