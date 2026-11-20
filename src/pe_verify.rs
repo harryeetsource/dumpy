@@ -9,6 +9,14 @@ pub struct TableAudit {
     pub symbols: usize,
     pub invalid_references: usize,
     pub resolved_iat_suspected: bool,
+    pub bad_names: usize,
+    pub bad_table_ranges: usize,
+    pub unterminated_tables: usize,
+    pub bad_ordinals: usize,
+    pub bad_forwarders: usize,
+    /// Bytes actually examined from the descriptor or directory header.
+    /// Useful to avoid treating unused directory padding as missing data.
+    pub directory_bytes_consumed: usize,
 }
 
 #[derive(Debug, Default)]
@@ -32,10 +40,11 @@ fn ascii_name(b: &[u8], start: usize, max: usize) -> bool {
     end > 0 && bytes[..end].iter().all(|byte| byte.is_ascii_graphic())
 }
 fn name_at(pe: &Pe, b: &[u8], rva: u32) -> bool {
-    pe.rva_to_raw(rva).is_some_and(|offset| ascii_name(b, offset, 512))
+    pe.rva_to_raw_span(rva).is_some_and(|(offset, available)|
+        ascii_name(b, offset, 512.min(available)))
 }
 fn range_at(pe: &Pe, b: &[u8], rva: u32, length: usize) -> Option<usize> {
-    let at = pe.rva_to_raw(rva)?;
+    let at = pe.rva_to_raw_range(rva, length)?;
     b.get(at..at.checked_add(length)?)?;
     Some(at)
 }
@@ -49,7 +58,11 @@ fn validate_imports(pe: &Pe, b: &[u8]) -> TableAudit {
     if pe.import.0 == 0 || pe.import.1 == 0 { return out; }
     out.status = "invalid";
     // Some linkers leave a small directory size despite a terminating descriptor.
-    let Some(base) = range_at(pe, b, pe.import.0, 20) else { return out };
+    let Some(base) = range_at(pe, b, pe.import.0, 20) else {
+        out.invalid_references += 1;
+        out.bad_table_ranges += 1;
+        return out;
+    };
     let stride = if pe.is_64 { 8usize } else { 4usize };
     let mut terminated = false;
     let descriptor_limit = (pe.import.1 as usize / 20).saturating_add(1).clamp(1, 4096);
@@ -57,12 +70,13 @@ fn validate_imports(pe: &Pe, b: &[u8]) -> TableAudit {
         let Some(offset) = base.checked_add(index * 20) else { break };
         let (Some(oft), Some(name), Some(ft)) = (read_u32(b, offset),
             read_u32(b, offset + 12), read_u32(b, offset + 16)) else { break };
+        out.directory_bytes_consumed = (index + 1) * 20;
         if oft == 0 && name == 0 && ft == 0 {
             terminated = true;
             break;
         }
         out.entries += 1;
-        if !name_at(pe, b, name) { out.invalid_references += 1; }
+        if !name_at(pe, b, name) { out.invalid_references += 1; out.bad_names += 1; }
         let table_rva = if oft != 0 { oft } else { ft };
         if oft == 0 { out.resolved_iat_suspected = true; }
         let mut thunk_terminated = false;
@@ -80,19 +94,38 @@ fn validate_imports(pe: &Pe, b: &[u8]) -> TableAudit {
             let ordinal_mask = if pe.is_64 { 1u64 << 63 } else { 1u64 << 31 };
             if entry & ordinal_mask != 0 {
                 // Ordinal imports contain no name; lower 16 bits hold ordinal.
-                if entry & !(ordinal_mask | 0xffff) != 0 { out.invalid_references += 1; }
+                if entry & !(ordinal_mask | 0xffff) != 0 {
+                    out.invalid_references += 1;
+                    out.bad_ordinals += 1;
+                }
             } else if let Ok(name_rva) = u32::try_from(entry) {
                 // IMAGE_IMPORT_BY_NAME: 2-byte hint, then ASCII name.
                 let valid = range_at(pe, b, name_rva, 3)
-                    .is_some_and(|pos| ascii_name(b, pos + 2, 512));
-                if !valid { out.invalid_references += 1; }
+                    .is_some_and(|pos| pe.rva_to_raw_span(name_rva)
+                        .is_some_and(|(_, available)| available > 2 &&
+                            ascii_name(b, pos + 2, 512.min(available - 2))));
+                if !valid { out.invalid_references += 1; out.bad_names += 1; }
             } else {
                 out.invalid_references += 1;
+                out.bad_names += 1;
             }
         }
-        if !thunk_terminated { out.invalid_references += 1; }
+        if !thunk_terminated {
+            out.invalid_references += 1;
+            out.unterminated_tables += 1;
+        }
     }
-    if !terminated { out.invalid_references += 1; }
+    if !terminated {
+        out.invalid_references += 1;
+        out.unterminated_tables += 1;
+    }
+    // A declared, nonempty import directory containing only an immediate
+    // null descriptor is not a successfully recovered import table. It is
+    // common when missing RAM pages were zero-filled during reconstruction.
+    if out.entries == 0 {
+        out.invalid_references += 1;
+        out.bad_table_ranges += 1;
+    }
     out.status = if out.invalid_references == 0 { "valid" } else { "invalid" };
     out
 }
@@ -101,14 +134,23 @@ fn validate_exports(pe: &Pe, b: &[u8]) -> TableAudit {
     let mut out = TableAudit { status: "absent", ..Default::default() };
     if pe.export.0 == 0 || pe.export.1 == 0 { return out; }
     out.status = "invalid";
-    let Some(dir) = range_at(pe, b, pe.export.0, 40) else { return out };
+    let Some(dir) = range_at(pe, b, pe.export.0, 40) else {
+        out.invalid_references += 1;
+        out.bad_table_ranges += 1;
+        return out;
+    };
+    out.directory_bytes_consumed = 40;
     let (Some(name), Some(functions), Some(names), Some(func_table), Some(name_table), Some(ord_table)) =
         (read_u32(b, dir + 12), read_u32(b, dir + 20), read_u32(b, dir + 24),
          read_u32(b, dir + 28), read_u32(b, dir + 32), read_u32(b, dir + 36)) else { return out };
-    if functions > 65536 || names > functions { return out; }
+    if functions > 65536 || names > functions {
+        out.invalid_references += 1;
+        out.bad_table_ranges += 1;
+        return out;
+    }
     out.entries = functions as usize;
     out.symbols = names as usize;
-    if !name_at(pe, b, name) { out.invalid_references += 1; }
+    if !name_at(pe, b, name) { out.invalid_references += 1; out.bad_names += 1; }
     let function_pos = if functions == 0 { Some(0) } else {
         range_at(pe, b, func_table, functions as usize * 4)
     };
@@ -119,16 +161,21 @@ fn validate_exports(pe: &Pe, b: &[u8]) -> TableAudit {
         range_at(pe, b, ord_table, names as usize * 2)
     };
     let (Some(function_pos), Some(name_pos), Some(ordinal_pos)) =
-        (function_pos, name_pos, ordinal_pos) else { out.invalid_references += 1; return out };
+        (function_pos, name_pos, ordinal_pos) else {
+            out.invalid_references += 1;
+            out.bad_table_ranges += 1;
+            return out;
+        };
     for i in 0..functions as usize {
         let Some(rva) = read_u32(b, function_pos + i * 4) else { out.invalid_references += 1; break };
         if rva == 0 { continue; }
         let forwarder = (pe.export.0 as u64..pe.export.0 as u64 + pe.export.1 as u64)
             .contains(&(rva as u64));
         if forwarder {
-            if !name_at(pe, b, rva) { out.invalid_references += 1; }
+            if !name_at(pe, b, rva) { out.invalid_references += 1; out.bad_forwarders += 1; }
         } else if rva as usize >= pe.size_of_image {
             out.invalid_references += 1;
+            out.bad_table_ranges += 1;
         }
     }
     for i in 0..names as usize {
@@ -137,9 +184,8 @@ fn validate_exports(pe: &Pe, b: &[u8]) -> TableAudit {
                 out.invalid_references += 1;
                 break;
             };
-        if ordinal as u32 >= functions || !name_at(pe, b, name_rva) {
-            out.invalid_references += 1;
-        }
+        if ordinal as u32 >= functions { out.invalid_references += 1; out.bad_ordinals += 1; }
+        if !name_at(pe, b, name_rva) { out.invalid_references += 1; out.bad_names += 1; }
     }
     out.status = if out.invalid_references == 0 { "valid" } else { "invalid" };
     out
@@ -161,7 +207,7 @@ mod tests {
             raw_file_size: 0xa00, sections: vec![Section { name: ".rdata".into(),
                 virtual_address: 0x1000, virtual_size: 0x800,
                 raw_offset: 0x200, raw_size: 0x800, characteristics: 0x4000_0040 }],
-            import: (0x1000, 40), export: (0, 0) };
+            import: (0x1000, 40), export: (0, 0), resource: (0, 0), timestamp: 0, characteristics: 0, machine: 0x8664, entry_point: 0x1000 };
         let mut bytes = vec![0u8; 0xa00];
         bytes[0x200..0x204].copy_from_slice(&0x1200u32.to_le_bytes());
         bytes[0x20c..0x210].copy_from_slice(&0x1100u32.to_le_bytes());
@@ -173,7 +219,34 @@ mod tests {
         assert_eq!(audit.imports.status, "valid");
         assert_eq!(audit.imports.entries, 1);
         assert_eq!(audit.imports.symbols, 1);
+        assert_eq!(audit.imports.directory_bytes_consumed, 40);
         bytes[0x400..0x408].copy_from_slice(&0x7fff_ffffu64.to_le_bytes());
-        assert_eq!(validate(&pe, &bytes).imports.status, "invalid");
+        let broken = validate(&pe, &bytes);
+        assert_eq!(broken.imports.status, "invalid");
+        assert_eq!(broken.imports.bad_names, 1);
+        assert_eq!(broken.imports.invalid_references, 1);
+        assert_eq!(broken.imports.bad_table_ranges, 0);
+    }
+    #[test]
+    fn reports_unmapped_import_directory_as_table_range_failure() {
+        let pe = Pe { is_64: true, size_of_image: 0x2000, headers_size: 0x200,
+            raw_file_size: 0x200, sections: Vec::new(),
+            import: (0x1000, 40), export: (0, 0), resource: (0, 0), timestamp: 0, characteristics: 0, machine: 0x8664, entry_point: 0x1000 };
+        let audit = validate(&pe, &[0u8; 0x200]);
+        assert_eq!(audit.imports.status, "invalid");
+        assert_eq!(audit.imports.bad_table_ranges, 1);
+        assert_eq!(audit.imports.invalid_references, 1);
+    }
+    #[test]
+    fn rejects_nonzero_import_directory_with_empty_first_descriptor() {
+        let pe = Pe { is_64: true, size_of_image: 0x2000, headers_size: 0x200,
+            raw_file_size: 0x400, sections: vec![Section { name: ".idata".into(),
+                virtual_address: 0x1000, virtual_size: 0x200,
+                raw_offset: 0x200, raw_size: 0x200, characteristics: 0x4000_0040 }],
+            import: (0x1000, 40), export: (0, 0), resource: (0, 0), timestamp: 0, characteristics: 0, machine: 0x8664, entry_point: 0x1000 };
+        let audit = validate(&pe, &[0u8; 0x400]);
+        assert_eq!(audit.imports.status, "invalid");
+        assert_eq!(audit.imports.entries, 0);
+        assert_eq!(audit.imports.bad_table_ranges, 1);
     }
 }

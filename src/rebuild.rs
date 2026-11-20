@@ -31,6 +31,11 @@ pub struct Pe {
     pub sections: Vec<Section>,
     pub import: (u32, u32),
     pub export: (u32, u32),
+    pub resource: (u32, u32),
+    pub timestamp: u32,
+    pub characteristics: u16,
+    pub machine: u16,
+    pub entry_point: u32,
 }
 
 impl Pe {
@@ -43,6 +48,9 @@ impl Pe {
         }
         let coff = nt + 4;
         let count = u16_at(b, coff + 2).ok_or("short COFF header")? as usize;
+        let machine = u16_at(b, coff).ok_or("short COFF header")?;
+        let timestamp = u32_at(b, coff + 4).ok_or("short COFF header")?;
+        let characteristics = u16_at(b, coff + 18).ok_or("short COFF header")?;
         if count == 0 || count > MAX_SECTIONS { return Err("invalid section count".into()); }
         let opt_size = u16_at(b, coff + 16).ok_or("short COFF header")? as usize;
         let opt = coff + 20;
@@ -55,6 +63,7 @@ impl Pe {
             _ => return Err("unknown optional header magic".into()),
         };
         if opt_size < min_opt { return Err("short optional header".into()); }
+        let entry_point = u32_at(b, opt + 16).ok_or("missing AddressOfEntryPoint")?;
         let size_of_image = u32_at(b, opt + 56).ok_or("missing SizeOfImage")? as usize;
         let headers_size = u32_at(b, opt + 60).ok_or("missing SizeOfHeaders")? as usize;
         let section_alignment = u32_at(b, opt + 32).ok_or("missing SectionAlignment")?;
@@ -98,7 +107,109 @@ impl Pe {
                 characteristics });
         }
         Ok(Self { is_64, size_of_image, headers_size, raw_file_size, sections,
-            import: directory(1), export: directory(0) })
+            import: directory(1), export: directory(0), resource: directory(2),
+            timestamp, characteristics, machine, entry_point })
+    }
+
+    /// DLL names from the import descriptor table, in order, at most `max`.
+    pub fn import_dll_names(&self, b: &[u8], max: usize) -> (Vec<String>, usize) {
+        let mut names = Vec::new();
+        let mut total = 0usize;
+        if self.import.0 == 0 { return (names, 0); }
+        let Some(base) = self.rva_to_raw_range(self.import.0, 20) else { return (names, 0) };
+        for i in 0..4096usize {
+            let at = base + i * 20;
+            let (Some(oft), Some(name_rva), Some(ft)) = (u32_at(b, at), u32_at(b, at + 12), u32_at(b, at + 16)) else { break };
+            if oft == 0 && name_rva == 0 && ft == 0 { break; }
+            total += 1;
+            if names.len() >= max { continue; }
+            let Some((pos, avail)) = self.rva_to_raw_span(name_rva) else { continue };
+            let Some(bytes) = b.get(pos..pos + avail.min(128)) else { continue };
+            let Some(end) = bytes.iter().position(|v| *v == 0) else { continue };
+            if end > 0 && bytes[..end].iter().all(|v| v.is_ascii_graphic()) {
+                names.push(String::from_utf8_lossy(&bytes[..end]).into_owned());
+            }
+        }
+        (names, total)
+    }
+
+    /// One-line triage summary of recovered file-layout bytes.
+    pub fn summary(&self, b: &[u8]) -> String {
+        let secs = self.sections.iter().map(|s| s.name.replace([' ', ';', '='], "_")).collect::<Vec<_>>().join(",");
+        let (imports, total) = self.import_dll_names(b, 4);
+        let any_code = self.sections.iter().any(|s| s.characteristics & 0x2000_0020 != 0);
+        // Resource-only images (MUI files, satellite assemblies) have no
+        // entry point, no imports and no executable section; they are loaded
+        // as data files and never appear in a loader list.
+        let kind = if self.entry_point == 0 && total == 0 && !any_code { "resource-only" }
+            else if self.characteristics & 0x2000 != 0 { "dll" } else { "exe" };
+        let machine = match self.machine { 0x14c => "i386", 0x8664 => "amd64", 0xaa64 => "arm64", _ => "other" };
+        let imports = if total > imports.len() { format!("{}(+{})", imports.join(","), total - imports.len()) }
+            else { imports.join(",") };
+        let exports = if self.export.0 != 0 {
+            self.rva_to_raw_range(self.export.0, 40).and_then(|d| u32_at(b, d + 20)).unwrap_or(0)
+        } else { 0 };
+        format!("{kind} {machine} ts=0x{:08x} secs={secs} imports={imports} exports={exports}", self.timestamp)
+    }
+
+    /// `OriginalFilename` (else `InternalName`) from VS_VERSIONINFO, located
+    /// through the resource directory: root → RT_VERSION (16) → first name
+    /// → first language → data entry. Every step is bounds-checked against
+    /// recovered file-layout bytes; a resource section that was not resident
+    /// simply yields None. Naming fallback only, never identity.
+    pub fn version_name(&self, b: &[u8]) -> Option<String> {
+        let (root_rva, dir_size) = self.resource;
+        if root_rva == 0 || dir_size < 16 { return None; }
+        let root = self.rva_to_raw_range(root_rva, 16)?;
+        // Walk one directory level: return the entry's OffsetToData for the
+        // entry whose ID matches `want`, or the first entry when None.
+        let child = |dir: usize, want: Option<u32>| -> Option<u32> {
+            let named = u16_at(b, dir + 12)? as usize;
+            let ids = u16_at(b, dir + 14)? as usize;
+            let count = named.checked_add(ids)?.min(256);
+            for i in 0..count {
+                let at = dir.checked_add(16 + i * 8)?;
+                let id = u32_at(b, at)?;
+                let offset = u32_at(b, at + 4)?;
+                if want.map_or(true, |w| id == w) { return Some(offset); }
+            }
+            None
+        };
+        let sub = |offset: u32| -> Option<usize> {
+            if offset & 0x8000_0000 == 0 { return None; }
+            let rel = (offset & 0x7fff_ffff) as usize;
+            if rel >= dir_size as usize { return None; }
+            self.rva_to_raw_range(root_rva.checked_add(rel as u32)?, 16)
+        };
+        let type_dir = sub(child(root, Some(16))?)?;
+        let name_dir = sub(child(type_dir, None)?)?;
+        let leaf = child(name_dir, None)?;
+        if leaf & 0x8000_0000 != 0 { return None; }
+        let data_entry = self.rva_to_raw_range(root_rva.checked_add(leaf)?, 16)?;
+        let data_rva = u32_at(b, data_entry)?;
+        let data_size = u32_at(b, data_entry + 4)? as usize;
+        if data_size < 64 || data_size > 1 << 20 { return None; }
+        let data_at = self.rva_to_raw_range(data_rva, data_size)?;
+        let blob = b.get(data_at..data_at + data_size)?;
+        let find = |key: &str| -> Option<String> {
+            let needle: Vec<u8> = key.encode_utf16().chain([0u16]).flat_map(u16::to_le_bytes).collect();
+            let at = blob.windows(needle.len()).position(|w| w == needle.as_slice())?;
+            // Key, NUL, then pad to a 4-byte boundary, then the value string.
+            let mut pos = (at + needle.len() + 3) & !3;
+            let mut units = Vec::new();
+            while let Some(pair) = blob.get(pos..pos + 2) {
+                let unit = u16::from_le_bytes([pair[0], pair[1]]);
+                if unit == 0 { break; }
+                units.push(unit);
+                pos += 2;
+                if units.len() > 260 { return None; }
+            }
+            let value = String::from_utf16(&units).ok()?;
+            let trimmed = value.trim();
+            (!trimmed.is_empty() && trimmed.chars().all(|c| !c.is_control()))
+                .then(|| trimmed.to_owned())
+        };
+        find("OriginalFilename").or_else(|| find("InternalName"))
     }
 
     pub fn rva_to_raw(&self, rva: u32) -> Option<usize> {
@@ -110,6 +221,29 @@ impl Pe {
                 s.raw_offset.checked_add(delta)
             } else { None }
         })
+    }
+
+    /// Map an RVA range only when *every byte* is contained in the PE
+    /// headers or in one section's initialized raw data. An RVA's starting
+    /// offset alone is insufficient: allowing a read to cross a raw section
+    /// boundary can reinterpret unrelated bytes as a valid PE table.
+    pub fn rva_to_raw_span(&self, rva: u32) -> Option<(usize, usize)> {
+        let start = rva as usize;
+        if start < self.headers_size {
+            return Some((start, self.headers_size - start));
+        }
+        self.sections.iter().find_map(|section| {
+            let offset = start.checked_sub(section.virtual_address)?;
+            if offset < section.raw_size &&
+               offset < max(section.virtual_size, section.raw_size) {
+                Some((section.raw_offset.checked_add(offset)?, section.raw_size - offset))
+            } else { None }
+        })
+    }
+
+    pub fn rva_to_raw_range(&self, rva: u32, length: usize) -> Option<usize> {
+        let (raw, remaining) = self.rva_to_raw_span(rva)?;
+        (length <= remaining).then_some(raw)
     }
 
     pub fn rva_to_mapped(&self, rva: u32) -> Option<usize> {
@@ -157,6 +291,23 @@ impl Pe {
         // Import/export directory entries and their internal pointers are RVAs, not file offsets.
         // They must not be rewritten when converting mapped section bytes to raw layout.
         Ok(result)
+    }
+
+    /// The module name recorded in the export directory, if the directory
+    /// and the name string are both inside recovered file-layout bytes.
+    /// Used only as a naming fallback; it is never trusted for identity.
+    pub fn export_name(&self, b: &[u8]) -> Option<String> {
+        if self.export.0 == 0 || self.export.1 < 40 { return None; }
+        let dir = self.rva_to_raw_range(self.export.0, 40)?;
+        let name_rva = u32_at(b, dir + 12)?;
+        // A zero or in-header Name RVA (seen on damaged tables) would resolve
+        // to the DOS header and yield "MZ…" as a name.
+        if (name_rva as usize) < self.headers_size { return None; }
+        let (at, available) = self.rva_to_raw_span(name_rva)?;
+        let bytes = b.get(at..at + available.min(256))?;
+        let end = bytes.iter().position(|v| *v == 0)?;
+        if end == 0 || !bytes[..end].iter().all(|v| v.is_ascii_graphic()) { return None; }
+        Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
     }
 
     pub fn directory_report(&self, b: &[u8]) -> String {
@@ -219,4 +370,67 @@ mod tests {
     }
     #[test]
     fn rejects_truncated_input() { assert!(Pe::parse(b"MZ").is_err()); }
+    #[test]
+    fn version_name_walks_resource_tree_to_original_filename() {
+        // .rsrc at RVA 0x2000 / raw 0x400: root dir -> RT_VERSION subdir
+        // (+0x20) -> name subdir (+0x40) -> data entry (+0x60) -> blob (+0x100).
+        let pe = Pe { is_64: true, size_of_image: 0x3000, headers_size: 0x200,
+            raw_file_size: 0x800, sections: vec![Section { name: ".rsrc".into(),
+                virtual_address: 0x2000, virtual_size: 0x400, raw_offset: 0x400,
+                raw_size: 0x400, characteristics: 0x4000_0040 }],
+            import: (0, 0), export: (0, 0), resource: (0x2000, 0x400), timestamp: 0, characteristics: 0, machine: 0x8664, entry_point: 0x1000 };
+        let mut b = vec![0u8; 0x800];
+        let w16 = |b: &mut [u8], at: usize, v: u16| b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let r = 0x400;
+        w16(&mut b, r + 14, 1); w32(&mut b, r + 16, 16); w32(&mut b, r + 20, 0x8000_0020);
+        w16(&mut b, r + 0x20 + 14, 1); w32(&mut b, r + 0x20 + 16, 1); w32(&mut b, r + 0x20 + 20, 0x8000_0040);
+        w16(&mut b, r + 0x40 + 14, 1); w32(&mut b, r + 0x40 + 16, 0x409); w32(&mut b, r + 0x40 + 20, 0x60);
+        w32(&mut b, r + 0x60, 0x2100); w32(&mut b, r + 0x60 + 4, 0x100);
+        let mut blob = Vec::new();
+        for ch in "VS_VERSION_INFO".encode_utf16() { blob.extend(ch.to_le_bytes()); }
+        blob.extend([0, 0]);
+        while blob.len() % 4 != 0 { blob.push(0); }
+        for ch in "OriginalFilename".encode_utf16() { blob.extend(ch.to_le_bytes()); }
+        blob.extend([0, 0]);
+        while blob.len() % 4 != 0 { blob.push(0); }
+        for ch in "widget.dll".encode_utf16() { blob.extend(ch.to_le_bytes()); }
+        blob.extend([0, 0]);
+        b[r + 0x100..r + 0x100 + blob.len()].copy_from_slice(&blob);
+        assert_eq!(pe.version_name(&b).as_deref(), Some("widget.dll"));
+        // A non-resident data page (zeroed) yields nothing rather than junk.
+        for x in &mut b[r + 0x100..r + 0x200] { *x = 0; }
+        assert_eq!(pe.version_name(&b), None);
+    }
+    #[test]
+    fn export_name_reads_only_inside_mapped_raw_bytes() {
+        let pe = Pe { is_64: true, size_of_image: 0x2000, headers_size: 0x200,
+            raw_file_size: 0x400, sections: vec![Section { name: ".edata".into(),
+                virtual_address: 0x1000, virtual_size: 0x200, raw_offset: 0x200,
+                raw_size: 0x200, characteristics: 0x4000_0040 }],
+            import: (0, 0), export: (0x1000, 40), resource: (0, 0), timestamp: 0, characteristics: 0, machine: 0x8664, entry_point: 0x1000 };
+        let mut b = vec![0u8; 0x400];
+        b[0x20c..0x210].copy_from_slice(&0x1100u32.to_le_bytes());
+        b[0x300..0x30a].copy_from_slice(b"ntdll.dll\0");
+        assert_eq!(pe.export_name(&b).as_deref(), Some("ntdll.dll"));
+        b[0x20c..0x210].copy_from_slice(&0x1f00u32.to_le_bytes());
+        assert_eq!(pe.export_name(&b), None);
+        // Name RVA 0 points at the DOS header: must not produce "MZ...".
+        b[0x20c..0x210].copy_from_slice(&0u32.to_le_bytes());
+        b[..3].copy_from_slice(b"MZx");
+        assert_eq!(pe.export_name(&b), None);
+    }
+    #[test]
+    fn raw_rva_range_never_crosses_section_or_header_boundaries() {
+        let pe = Pe { is_64: true, size_of_image: 0x3000, headers_size: 0x200,
+            raw_file_size: 0x600, sections: vec![Section {
+                name: ".idata".into(), virtual_address: 0x1000,
+                virtual_size: 0x200, raw_offset: 0x400, raw_size: 0x200,
+                characteristics: 0x4000_0040 }],
+            import: (0, 0), export: (0, 0), resource: (0, 0), timestamp: 0, characteristics: 0, machine: 0x8664, entry_point: 0x1000 };
+        assert_eq!(pe.rva_to_raw_range(0x11f0, 16), Some(0x5f0));
+        assert_eq!(pe.rva_to_raw_range(0x11f0, 17), None);
+        assert_eq!(pe.rva_to_raw_range(0x1f0, 16), Some(0x1f0));
+        assert_eq!(pe.rva_to_raw_range(0x1f0, 17), None);
+    }
 }

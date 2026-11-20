@@ -1,6 +1,7 @@
 //! Recover kernel PE image sections from validated module mappings.
 //! Missing virtual pages are zero-filled *only in explicitly partial outputs*.
 use crate::kernel_modules::KernelModule;
+use crate::coherence;
 use crate::memory::PhysicalMemory;
 use crate::rebuild::{Pe, MAX_IMAGE};
 use crate::pe_verify::{self, PeAudit};
@@ -37,9 +38,73 @@ pub struct RecoveryRecord {
     pub missing_file_backed_pages: usize,
     pub executable_pages: usize,
     pub missing_executable_pages: usize,
+    /// Pages whose translation went through a Windows transition PTE
+    /// (standby/modified list). Their bytes are the page's last contents,
+    /// but the page was not hardware-valid at acquisition time.
+    pub transition_pages: usize,
     pub sections: Vec<SectionCoverage>,
     pub audit: Option<PeAudit>,
     pub priority: &'static str,
+    pub layout: &'static str,
+    pub layout_evidence: LayoutEvidence,
+    pub executable_utf16_ratio: f64,
+    pub incoherent_warning: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct LayoutEvidence {
+    pub raw_import: &'static str,
+    pub raw_import_entries: usize,
+    pub raw_import_symbols: usize,
+    pub mapped_import: &'static str,
+    pub mapped_import_entries: usize,
+    pub mapped_import_symbols: usize,
+    pub raw_export: &'static str,
+    pub mapped_export: &'static str,
+}
+
+/// A virtual address range can expose either an image view (section RVAs)
+/// or a file view (section raw offsets). Select a raw file view only when
+/// real import/export structures give positive evidence for that layout.
+/// Missing or absent directories do not vote for raw layout.
+pub fn choose_layout(pe: &Pe, source: &[u8]) -> Result<(Vec<u8>, &'static str), String> {
+    choose_layout_detailed(pe, source).map(|(bytes, layout, _)| (bytes, layout))
+}
+
+pub fn choose_layout_detailed(pe: &Pe, source: &[u8])
+    -> Result<(Vec<u8>, &'static str, LayoutEvidence), String> {
+    let mapped = pe.recover_mapped(source)?;
+    if source.len() < pe.raw_file_size {
+        return Ok((mapped, "mapped-image", LayoutEvidence::default()));
+    }
+    let raw = &source[..pe.raw_file_size];
+    let raw_audit = pe_verify::validate(pe, raw);
+    let mapped_audit = pe_verify::validate(pe, &mapped);
+    let evidence = LayoutEvidence {
+        raw_import: raw_audit.imports.status,
+        raw_import_entries: raw_audit.imports.entries,
+        raw_import_symbols: raw_audit.imports.symbols,
+        mapped_import: mapped_audit.imports.status,
+        mapped_import_entries: mapped_audit.imports.entries,
+        mapped_import_symbols: mapped_audit.imports.symbols,
+        raw_export: raw_audit.exports.status,
+        mapped_export: mapped_audit.exports.status,
+    };
+    // A nonzero import directory that immediately contains a null descriptor
+    // is not evidence of a raw file view: zero-filled uncaptured memory can
+    // produce exactly that pattern. Demand at least one real descriptor and
+    // symbol (or a nonempty export function table) as affirmative evidence.
+    let score = |audit: &PeAudit| -> usize {
+        usize::from(audit.imports.status == "valid" && audit.imports.entries > 0 &&
+            audit.imports.symbols > 0)
+        + usize::from(audit.exports.status == "valid" && audit.exports.entries > 0)
+    };
+    let raw_valid = score(&raw_audit);
+    let mapped_valid = score(&mapped_audit);
+    if raw_valid > mapped_valid {
+        return Ok((raw.to_vec(), "raw-file-view", evidence));
+    }
+    Ok((mapped, "mapped-image", evidence))
 }
 
 fn intersects(page_start: u64, range_start: u64, range_size: u64) -> bool {
@@ -84,8 +149,9 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
         missing_import_pages: 0, missing_export_pages: 0, fallback_pages: 0,
         fallback_sources: Vec::new(), file_backed_pages: 0,
         missing_file_backed_pages: 0, executable_pages: 0,
-        missing_executable_pages: 0, sections: Vec::new(), audit: None,
-        priority: "unavailable" };
+        missing_executable_pages: 0, transition_pages: 0, sections: Vec::new(), audit: None,
+        priority: "unavailable", layout: "unknown", layout_evidence: LayoutEvidence::default(),
+        executable_utf16_ratio: 0.0, incoherent_warning: false };
     if size == 0 || size > MAX_IMAGE {
         record.diagnostics = "image size exceeds recovery limit".into();
         return Ok(record);
@@ -99,9 +165,11 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
         let mut recovered = false;
         let mut original_error = None;
         for (root_index, dtb) in dtbs.iter().enumerate() {
+            let before = memory.transition_translations;
             match memory.read_virtual(*dtb, va, page, 4) {
                 Ok(()) => {
                     record.available_pages += 1;
+                    if memory.transition_translations != before { record.transition_pages += 1; }
                     if root_index > 0 {
                         record.fallback_pages += 1;
                         record.fallback_sources.push((va, *dtb));
@@ -121,14 +189,35 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
         Ok(pe) => pe,
         Err(e) => { record.diagnostics = format!("PE header unavailable or invalid: {e}"); return Ok(record); }
     };
+    let (rebuilt, layout, evidence) = match choose_layout_detailed(&pe, &mapped) {
+        Ok(result) => result,
+        Err(e) => { record.diagnostics = format!("section reconstruction failed: {e}"); return Ok(record); }
+    };
+    record.layout = layout;
+    record.layout_evidence = evidence;
+    let mut audit = pe_verify::validate(&pe, &rebuilt);
+    let raw_view = layout == "raw-file-view";
+    let directory_start = |rva: u32| -> u64 {
+        if raw_view { pe.rva_to_raw(rva).unwrap_or(usize::MAX) as u64 }
+        else { rva as u64 }
+    };
     for (missing_va, _) in &record.missing_pages {
         if intersects(*missing_va, module.image_base, pe.headers_size as u64) {
             record.missing_header_pages += 1;
         }
-        if intersects(*missing_va, module.image_base.saturating_add(pe.import.0 as u64), pe.import.1 as u64) {
+        // A linker may declare more directory bytes than the actual number
+        // of descriptors, including padding beyond the terminating entry.
+        // Only the consumed descriptor span is relevant to a *valid* table.
+        let import_length = if audit.imports.status == "valid" &&
+            audit.imports.directory_bytes_consumed > 0 {
+            audit.imports.directory_bytes_consumed as u64
+        } else { pe.import.1 as u64 };
+        if pe.import.0 != 0 && intersects(*missing_va,
+            module.image_base.saturating_add(directory_start(pe.import.0)), import_length) {
             record.missing_import_pages += 1;
         }
-        if intersects(*missing_va, module.image_base.saturating_add(pe.export.0 as u64), pe.export.1 as u64) {
+        if pe.export.0 != 0 && intersects(*missing_va,
+            module.image_base.saturating_add(directory_start(pe.export.0)), pe.export.1 as u64) {
             record.missing_export_pages += 1;
         }
     }
@@ -142,12 +231,13 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
         let mut coverage = SectionCoverage { name: section.name.clone(),
             virtual_address: section.virtual_address, raw_size: section.raw_size,
             executable, pages: 0, missing_pages: 0 };
-        let first = section.virtual_address / 4096;
-        let last = section.virtual_address.saturating_add(section.raw_size)
+        let start = if raw_view { section.raw_offset } else { section.virtual_address };
+        let first = start / 4096;
+        let last = start.saturating_add(section.raw_size)
             .saturating_add(4095) / 4096;
         for index in first..last.min(mapped.len().div_ceil(4096)) {
             let relative = (index as u64) * 4096;
-            if intersects(relative, section.virtual_address as u64, section.raw_size as u64) {
+            if intersects(relative, start as u64, section.raw_size as u64) {
                 coverage.pages += 1;
                 if missing_set.contains(&module.image_base.saturating_add(relative)) {
                     coverage.missing_pages += 1;
@@ -159,9 +249,10 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
     for (index, _) in mapped.chunks(4096).enumerate() {
         let relative = index as u64 * 4096;
         let file_backed = intersects(relative, 0, pe.headers_size as u64) ||
-            pe.sections.iter().any(|s| intersects(relative, s.virtual_address as u64, s.raw_size as u64));
+            pe.sections.iter().any(|s| intersects(relative,
+                if raw_view { s.raw_offset as u64 } else { s.virtual_address as u64 }, s.raw_size as u64));
         let executable = pe.sections.iter().any(|s| s.characteristics & 0x2000_0000 != 0 &&
-            intersects(relative, s.virtual_address as u64, s.raw_size as u64));
+            intersects(relative, if raw_view { s.raw_offset as u64 } else { s.virtual_address as u64 }, s.raw_size as u64));
         let missing = missing_set.contains(&module.image_base.saturating_add(relative));
         if file_backed {
             record.file_backed_pages += 1;
@@ -172,20 +263,22 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
             if missing { record.missing_executable_pages += 1; }
         }
     }
-    let rebuilt = match pe.recover_mapped(&mapped) {
-        Ok(bytes) => bytes,
-        Err(e) => { record.diagnostics = format!("section reconstruction failed: {e}"); return Ok(record); }
-    };
-    let mut audit = pe_verify::validate(&pe, &rebuilt);
     if record.missing_import_pages > 0 && audit.imports.status != "absent" {
         audit.imports.status = "incomplete";
     }
     if record.missing_export_pages > 0 && audit.exports.status != "absent" {
         audit.exports.status = "incomplete";
     }
+    let profile = coherence::executable_text_profile(&pe, &rebuilt);
+    record.executable_utf16_ratio = profile.ratio();
+    record.incoherent_warning = profile.strongly_text_like() &&
+        audit.imports.status == "invalid" && audit.exports.status == "invalid" &&
+        record.missing_file_backed_pages == 0 && record.fallback_pages == 0;
     let tables_ok = matches!(audit.imports.status, "valid" | "absent") &&
         matches!(audit.exports.status, "valid" | "absent");
-    record.priority = if record.file_backed_pages > 0 &&
+    record.priority = if record.incoherent_warning {
+        "incoherent-review"
+    } else if record.file_backed_pages > 0 &&
         record.missing_file_backed_pages == 0 && tables_ok {
         "file-backed-complete"
     } else if record.executable_pages > 0 && record.missing_executable_pages == 0 && tables_ok {
@@ -203,10 +296,10 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
     fs::create_dir_all(dir)?;
     fs::write(&destination, &rebuilt)?;
     record.output = Some(destination.to_string_lossy().into_owned());
-    record.diagnostics = format!("{}; priority={}; fallback_pages={}; missing_header={} missing_import={} missing_export={}; file_backed={}/{} executable={}/{}; {}",
+    record.diagnostics = format!("{}; layout={}; priority={}; fallback_pages={}; transition_pages={}; missing_header={} missing_import={} missing_export={}; file_backed={}/{} executable={}/{}; {}",
         if record.fallback_pages > 0 { "merged process mappings (not guaranteed coherent)" }
-        else if complete { "complete pages" } else { "partial pages" }, record.priority,
-        record.fallback_pages,
+        else if complete { "complete pages" } else { "partial pages" }, record.layout, record.priority,
+        record.fallback_pages, record.transition_pages,
         record.missing_header_pages, record.missing_import_pages, record.missing_export_pages,
         record.file_backed_pages - record.missing_file_backed_pages, record.file_backed_pages,
         record.executable_pages - record.missing_executable_pages, record.executable_pages,
@@ -215,17 +308,22 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
 }
 
 pub fn write_report(dir: &Path, records: &[RecoveryRecord]) -> io::Result<()> {
-    let mut report = String::from("name\tbase\timage_bytes\tavailable_pages\tmissing_pages\tfallback_pages\tmissing_header\tmissing_import\tmissing_export\tfile_backed_pages\tmissing_file_backed_pages\texecutable_pages\tmissing_executable_pages\toutput\tdiagnostics\tpriority\timport_status\texport_status\n");
+    let mut report = String::from("name\tbase\timage_bytes\tavailable_pages\tmissing_pages\tfallback_pages\tmissing_header\tmissing_import\tmissing_export\tfile_backed_pages\tmissing_file_backed_pages\texecutable_pages\tmissing_executable_pages\toutput\tdiagnostics\tpriority\timport_status\texport_status\tlayout\traw_import_status\traw_import_descriptors\traw_import_symbols\tmapped_import_status\tmapped_import_descriptors\tmapped_import_symbols\traw_export_status\tmapped_export_status\texecutable_utf16_ascii_ratio\tincoherent_warning\ttransition_pages\n");
     for item in records {
         let imports = item.audit.as_ref().map(|a| a.imports.status).unwrap_or("unavailable");
         let exports = item.audit.as_ref().map(|a| a.exports.status).unwrap_or("unavailable");
-        report.push_str(&format!("{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        report.push_str(&format!("{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\n",
             clean_field(&item.name), item.base, item.image_size, item.available_pages,
             item.missing_pages.len(), item.fallback_pages, item.missing_header_pages, item.missing_import_pages,
             item.missing_export_pages, item.file_backed_pages, item.missing_file_backed_pages,
             item.executable_pages, item.missing_executable_pages,
             clean_field(item.output.as_deref().unwrap_or("")),
-            clean_field(&item.diagnostics), item.priority, imports, exports));
+            clean_field(&item.diagnostics), item.priority, imports, exports, item.layout,
+            item.layout_evidence.raw_import, item.layout_evidence.raw_import_entries,
+            item.layout_evidence.raw_import_symbols, item.layout_evidence.mapped_import,
+            item.layout_evidence.mapped_import_entries, item.layout_evidence.mapped_import_symbols,
+            item.layout_evidence.raw_export, item.layout_evidence.mapped_export,
+            item.executable_utf16_ratio, item.incoherent_warning, item.transition_pages));
     }
     fs::create_dir_all(dir)?;
     fs::write(dir.join("dumpy_recovery.tsv"), report)?;
@@ -253,21 +351,25 @@ pub fn write_report(dir: &Path, records: &[RecoveryRecord]) -> io::Result<()> {
         }
     }
     fs::write(dir.join("dumpy_sections.tsv"), section_report)?;
-    let mut validation = String::from("name\tbase\tpriority\timports\timport_descriptors\timport_symbols\timport_invalid_references\tresolved_iat_suspected\texports\texport_functions\texport_names\texport_invalid_references\n");
+    let mut validation = String::from("name\tbase\tpriority\timports\timport_descriptors\timport_symbols\timport_invalid_references\tresolved_iat_suspected\texports\texport_functions\texport_names\texport_invalid_references\timport_bad_names\timport_bad_table_ranges\timport_unterminated_tables\timport_bad_ordinals\texport_bad_names\texport_bad_table_ranges\texport_bad_ordinals\texport_bad_forwarders\tlayout\n");
     for item in records {
         if let Some(audit) = &item.audit {
-            validation.push_str(&format!("{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            validation.push_str(&format!("{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 clean_field(&item.name), item.base, item.priority,
                 audit.imports.status, audit.imports.entries, audit.imports.symbols,
                 audit.imports.invalid_references, audit.imports.resolved_iat_suspected,
                 audit.exports.status, audit.exports.entries, audit.exports.symbols,
-                audit.exports.invalid_references));
+                audit.exports.invalid_references,
+                audit.imports.bad_names, audit.imports.bad_table_ranges,
+                audit.imports.unterminated_tables, audit.imports.bad_ordinals,
+                audit.exports.bad_names, audit.exports.bad_table_ranges,
+                audit.exports.bad_ordinals, audit.exports.bad_forwarders, item.layout));
         }
     }
     fs::write(dir.join("dumpy_pe_validation.tsv"), validation)?;
     let rank = |value: &str| match value {
         "file-backed-complete" => 0usize, "executable-complete" => 1,
-        "high-coverage" => 2, "partial-review" => 3, _ => 4,
+        "high-coverage" => 2, "partial-review" => 3, "incoherent-review" => 4, _ => 5,
     };
     let mut sorted = records.iter().collect::<Vec<_>>();
     sorted.sort_by(|a, b| {
@@ -275,9 +377,9 @@ pub fn write_report(dir: &Path, records: &[RecoveryRecord]) -> io::Result<()> {
             .then(a.missing_file_backed_pages.cmp(&b.missing_file_backed_pages))
             .then(a.name.cmp(&b.name))
     });
-    let mut triage = String::from("priority\tname\tbase\tfile_backed_available\tfile_backed_total\texecutable_available\texecutable_total\tmissing_import_pages\tmissing_export_pages\timport_status\texport_status\toutput\n");
+    let mut triage = String::from("priority\tname\tbase\tfile_backed_available\tfile_backed_total\texecutable_available\texecutable_total\tmissing_import_pages\tmissing_export_pages\timport_status\texport_status\toutput\tlayout\texecutable_utf16_ascii_ratio\tincoherent_warning\n");
     for item in sorted {
-        triage.push_str(&format!("{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        triage.push_str(&format!("{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\n",
             item.priority, clean_field(&item.name), item.base,
             item.file_backed_pages.saturating_sub(item.missing_file_backed_pages),
             item.file_backed_pages,
@@ -285,7 +387,8 @@ pub fn write_report(dir: &Path, records: &[RecoveryRecord]) -> io::Result<()> {
             item.executable_pages, item.missing_import_pages, item.missing_export_pages,
             item.audit.as_ref().map(|a| a.imports.status).unwrap_or("unavailable"),
             item.audit.as_ref().map(|a| a.exports.status).unwrap_or("unavailable"),
-            clean_field(item.output.as_deref().unwrap_or(""))));
+            clean_field(item.output.as_deref().unwrap_or("")), item.layout,
+            item.executable_utf16_ratio, item.incoherent_warning));
     }
     fs::write(dir.join("dumpy_triage.tsv"), triage)
 }
@@ -293,6 +396,50 @@ pub fn write_report(dir: &Path, records: &[RecoveryRecord]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rebuild::Section;
+
+    fn test_image(raw: bool) -> (Pe, Vec<u8>) {
+        let pe = Pe { is_64: true, size_of_image: 0x2000, headers_size: 0x200,
+            raw_file_size: 0x800, sections: vec![Section {
+                name: ".idata".into(), virtual_address: 0x1000,
+                virtual_size: 0x600, raw_offset: 0x200, raw_size: 0x600,
+                characteristics: 0x4000_0040 }],
+            import: (0x1100, 40), export: (0, 0), resource: (0, 0), timestamp: 0, characteristics: 0, machine: 0x8664, entry_point: 0x1000 };
+        let mut source = vec![0u8; 0x2000];
+        let origin = if raw { 0x200usize } else { 0x1000usize };
+        source[origin + 0x100..origin + 0x104].copy_from_slice(&0x11a0u32.to_le_bytes());
+        source[origin + 0x10c..origin + 0x110].copy_from_slice(&0x1180u32.to_le_bytes());
+        source[origin + 0x110..origin + 0x114].copy_from_slice(&0x11a0u32.to_le_bytes());
+        source[origin + 0x180..origin + 0x18d].copy_from_slice(b"kernel32.dll\0");
+        source[origin + 0x1a0..origin + 0x1a8].copy_from_slice(&0x11c0u64.to_le_bytes());
+        source[origin + 0x1c2..origin + 0x1ce].copy_from_slice(b"CreateFileA\0");
+        (pe, source)
+    }
+
+    #[test]
+    fn selects_raw_file_view_from_valid_imports() {
+        let (pe, source) = test_image(true);
+        let (rebuilt, layout) = choose_layout(&pe, &source).unwrap();
+        assert_eq!(layout, "raw-file-view");
+        assert_eq!(pe_verify::validate(&pe, &rebuilt).imports.status, "valid");
+    }
+    #[test]
+    fn preserves_mapped_image_view_from_valid_imports() {
+        let (pe, source) = test_image(false);
+        let (rebuilt, layout) = choose_layout(&pe, &source).unwrap();
+        assert_eq!(layout, "mapped-image");
+        assert_eq!(pe_verify::validate(&pe, &rebuilt).imports.status, "valid");
+    }
+    #[test]
+    fn empty_raw_descriptor_cannot_outvote_damaged_mapped_imports() {
+        let (pe, mut source) = test_image(false);
+        // The raw-file candidate consists of zeros, so its first import
+        // descriptor looks like a valid empty terminator. The mapped image
+        // contains real but damaged import records and must remain selected.
+        source[0x1180] = 0xff;
+        let (_, layout) = choose_layout(&pe, &source).unwrap();
+        assert_eq!(layout, "mapped-image");
+    }
     #[test]
     fn filename_never_escapes_output_directory() {
         assert_eq!(safe_name("C:\\Windows\\System32\\drivers\\foo.sys"), "foo.sys");

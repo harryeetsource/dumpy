@@ -1,8 +1,12 @@
 mod crashdump;
+mod coherence;
 mod discovery;
 mod io;
 mod kernel_modules;
 mod memory;
+mod offline_coverage;
+mod peb;
+mod process_aware;
 mod processes;
 mod pe_verify;
 mod recovery;
@@ -186,16 +190,11 @@ fn recover_user_images(path: &Path, output: &Path, maximum_pages: Option<usize>,
     Ok(())
 }
 
-/// The acquisition format is unknown. Only attempt a tentative flat-physical
-/// mapping if multiple independent PML4 roots share a self-ref slot and one
-/// identical non-self kernel mapping. This is evidence, not definitive proof.
-fn recover_raw_user_images(file: &mut File, output: &Path,
-                           maximum_pages: Option<usize>, max_roots: Option<usize>,
-                           max_images: Option<usize>) -> std::io::Result<()> {
-    println!("[raw] Unknown acquisition format; probing for flat physical-address mapping.");
-    println!("[raw] File offsets are tentatively treated as physical addresses; results require independent validation.");
-    let mut physical = memory::PhysicalMemory::new(file)?;
-    let roots = discovery::discover_candidate_roots(&mut physical, 8192)?;
+/// A coherent root cohort is needed for tentative flat-physical acquisitions.
+/// Matching kernel mappings are evidence, not definitive acquisition metadata.
+fn coherent_raw_roots(physical: &mut memory::PhysicalMemory<'_>)
+    -> std::io::Result<Vec<discovery::RootCandidate>> {
+    let roots = discovery::discover_candidate_roots(physical, 8192)?;
     println!("[raw] Structural PML4 candidates: {}", roots.len());
     // A shared kernel PML4 entry provides a cross-root consistency check.
     // Ignore the self-reference itself; it would only confirm each root alone.
@@ -223,11 +222,24 @@ fn recover_raw_user_images(file: &mut File, output: &Path,
     let mut candidates = roots.into_iter().filter(|r| allowed.contains(&r.physical) && r.user_entries > 0)
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| b.user_entries.cmp(&a.user_entries).then(a.physical.cmp(&b.physical)));
-    println!("[raw] Consistent page-table cohort: {} user-capable roots", candidates.len());
     if candidates.is_empty() {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
             "coherent roots have no present user mappings; physical layout unverified"));
     }
+    Ok(candidates)
+}
+
+/// The acquisition format is unknown. Only attempt a tentative flat-physical
+/// mapping if multiple independent PML4 roots share a self-ref slot and one
+/// identical non-self kernel mapping. This is evidence, not definitive proof.
+fn recover_raw_user_images(file: &mut File, output: &Path,
+                           maximum_pages: Option<usize>, max_roots: Option<usize>,
+                           max_images: Option<usize>) -> std::io::Result<()> {
+    println!("[raw] Unknown acquisition format; probing for flat physical-address mapping.");
+    println!("[raw] File offsets are tentatively treated as physical addresses; results require independent validation.");
+    let mut physical = memory::PhysicalMemory::new(file)?;
+    let candidates = coherent_raw_roots(&mut physical)?;
+    println!("[raw] Consistent page-table cohort: {} user-capable roots", candidates.len());
     let max_raw_roots = max_roots.unwrap_or(32);
     const DEFAULT_RAW_PAGES: usize = 100_000;
     if candidates.len() > max_raw_roots {
@@ -314,6 +326,73 @@ fn recover_raw_user_images(file: &mut File, output: &Path,
     Ok(())
 }
 
+/// Process-aware recovery: require a structurally verified PEB loader list
+/// before treating a user mapping as a loaded image. MZ carving remains the
+/// separate --recover-user fallback path. The heavy lifting is in
+/// `process_aware`; this resolves roots and the EPROCESS pid/name hints.
+fn recover_process_aware(input: &Path, output: &Path, limits: &process_aware::Limits)
+                         -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    if limits.page_limit == 0 || limits.root_limit == 0 {
+        return Err(Error::new(ErrorKind::InvalidInput,
+            "page and root limits must both be positive"));
+    }
+    let workload = limits.page_limit.checked_mul(limits.root_limit).ok_or_else(||
+        Error::new(ErrorKind::InvalidInput, "process scan budget overflow"))?;
+    if workload > process_aware::MAX_TOTAL_SCANNED_PAGES {
+        return Err(Error::new(ErrorKind::InvalidInput,
+            format!("process scan budget {} pages exceeds safe cap {}; use a smaller per-root budget and batched root ranges",
+                workload, process_aware::MAX_TOTAL_SCANNED_PAGES)));
+    }
+    let mut file = File::open(input)?;
+    let format = memory::identify(&mut file)?;
+    if format == memory::DumpFormat::Minidump {
+        return Err(Error::new(ErrorKind::Unsupported,
+            "process-aware scanning of MDMP memory streams is not implemented"));
+    }
+    let crash = if format == memory::DumpFormat::WindowsCrashDump {
+        Some(crashdump::parse(&mut file)?)
+    } else { None };
+    let mut physical = memory::PhysicalMemory::new(&mut file)?;
+    let mut pid_by_dtb = HashMap::<u64, (String, String)>::new();
+    let mut roots = if let Some(info) = &crash {
+        let roots = discovery::discover_candidate_roots(&mut physical, 8192)?;
+        if info.dtb != 0 && info.active_process_head != 0 {
+            match processes::enumerate(&mut physical, info.dtb, info.active_process_head,
+                                        &roots, 65536) {
+                Ok(processes) => {
+                    if let Some(warning) = &processes.warning {
+                        eprintln!("[process-aware] process list partial: {warning}");
+                    }
+                    for process in processes.processes {
+                        for dtb in process.dtb_candidates {
+                            pid_by_dtb.insert(dtb,
+                                (process.pid_hint.map(|id| id.to_string())
+                                    .unwrap_or_else(|| "unknown".into()),
+                                 process.image_name_hint.clone()
+                                    .unwrap_or_else(|| "unknown".into())));
+                        }
+                    }
+                }
+                Err(e) => eprintln!("[process-aware] kernel process list unavailable: {e}"),
+            }
+        }
+        roots.into_iter().filter(|r| r.user_entries > 0).collect::<Vec<_>>()
+    } else {
+        println!("[process-aware] Unknown dump type; using only coherent tentative flat roots");
+        coherent_raw_roots(&mut physical)?
+    };
+    roots.sort_by(|a, b| b.user_entries.cmp(&a.user_entries)
+        .then(a.physical.cmp(&b.physical)));
+    if limits.root_start >= roots.len() {
+        return Err(Error::new(ErrorKind::InvalidInput,
+            format!("root start {} exceeds discovered root count {}", limits.root_start, roots.len())));
+    }
+    drop(physical);
+    process_aware::run(input, output, roots.into_iter().map(|r| r.physical).collect(),
+        &pid_by_dtb, limits)
+}
+
 /// Rank candidate address spaces cheaply before reconstructing the entire PE.
 /// Test up to 256 evenly spaced pages, including the first and last page.
 fn raw_image_coverage_sample(mem: &mut memory::PhysicalMemory<'_>, dtb: u64,
@@ -359,9 +438,19 @@ fn recover_kernel_modules(path: &Path, output: &Path) -> std::io::Result<()> {
 fn verify_existing_images(dir: &Path) -> std::io::Result<()> {
     let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
-    let mut results = String::from("file\tstatus\timports\timport_descriptors\timport_symbols\timport_invalid_references\tresolved_iat_suspected\texports\texport_functions\texport_names\texport_invalid_references\n");
+    let coverage = if let Some(report) = offline_coverage::find_report(dir) {
+        let map = offline_coverage::load(&report)?;
+        println!("[verify] recovery context: {} records from {}", map.len(), report.display());
+        Some(map)
+    } else {
+        eprintln!("[verify] WARNING: no dumpy_recovery.tsv in this directory or its parent; coverage-aware classifications unavailable");
+        None
+    };
+    let mut results = String::from("file\tstatus\timports\timport_descriptors\timport_symbols\timport_invalid_references\tresolved_iat_suspected\texports\texport_functions\texport_names\texport_invalid_references\timport_bad_names\timport_bad_table_ranges\timport_unterminated_tables\timport_bad_ordinals\texport_bad_names\texport_bad_table_ranges\texport_bad_ordinals\texport_bad_forwarders\tcoverage_found\tmissing_import_pages\tmissing_export_pages\tmissing_file_backed_pages\tfallback_pages\teffective_imports\teffective_exports\texecutable_utf16_ascii_ratio\tincoherent_warning\n");
     let mut checked = 0usize;
     let mut invalid = 0usize;
+    let mut matched = 0usize;
+    let mut complete_invalid = Vec::<(usize, String)>::new();
     for entry in entries {
         if !entry.file_type()?.is_file() { continue; }
         let file_name = entry.file_name().to_string_lossy().into_owned();
@@ -370,30 +459,187 @@ fn verify_existing_images(dir: &Path) -> std::io::Result<()> {
         let metadata = entry.metadata()?;
         if metadata.len() > MAX_IMAGE as u64 { continue; }
         let image = fs::read(entry.path())?;
-        let (status, audit) = match Pe::parse(&image) {
-            Ok(pe) => ("parsed", Some(pe_verify::validate(&pe, &image))),
-            Err(_) => ("invalid-pe", None),
+        let (status, audit, profile) = match Pe::parse(&image) {
+            Ok(pe) => ("parsed", Some(pe_verify::validate(&pe, &image)),
+                coherence::executable_text_profile(&pe, &image)),
+            Err(_) => ("invalid-pe", None, coherence::ExecutableTextProfile::default()),
         };
         checked += 1;
         if status != "parsed" { invalid += 1; }
         let imports = audit.as_ref().map(|a| &a.imports);
         let exports = audit.as_ref().map(|a| &a.exports);
-        results.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        let context = coverage.as_ref().and_then(|map| map.get(&file_name.to_ascii_lowercase()));
+        if context.is_some() { matched += 1; }
+        let raw_import = imports.map(|a| a.status).unwrap_or("unavailable");
+        let raw_export = exports.map(|a| a.status).unwrap_or("unavailable");
+        let effective_import = context.map(|c| offline_coverage::effective(raw_import,
+            c.missing_import, c.missing_file_backed)).unwrap_or("unknown-coverage");
+        let effective_export = context.map(|c| offline_coverage::effective(raw_export,
+            c.missing_export, c.missing_file_backed)).unwrap_or("unknown-coverage");
+        let incoherent_warning = profile.strongly_text_like() &&
+            raw_import == "invalid" && raw_export == "invalid" &&
+            context.is_some_and(|c| c.missing_file_backed == 0 && c.fallback_pages == 0);
+        if effective_import == "invalid-complete-file-pages" ||
+           effective_export == "invalid-complete-file-pages" {
+            let errors = imports.map(|a| a.invalid_references).unwrap_or(0)
+                .saturating_add(exports.map(|a| a.invalid_references).unwrap_or(0));
+            let row = format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                file_name.replace('\t', "_").replace('\n', "_").replace('\r', "_"),
+                effective_import, effective_export,
+                imports.map(|a| a.bad_names).unwrap_or(0),
+                imports.map(|a| a.bad_ordinals).unwrap_or(0),
+                imports.map(|a| a.unterminated_tables).unwrap_or(0),
+                exports.map(|a| a.bad_names).unwrap_or(0),
+                exports.map(|a| a.bad_table_ranges).unwrap_or(0),
+                exports.map(|a| a.bad_forwarders).unwrap_or(0),
+                context.map(|c| c.fallback_pages).unwrap_or(0));
+            complete_invalid.push((errors, row));
+        }
+        results.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\n",
             file_name.replace('\t', "_").replace('\n', "_").replace('\r', "_"), status,
-            imports.map(|a| a.status).unwrap_or("unavailable"),
+            raw_import,
             imports.map(|a| a.entries).unwrap_or(0),
             imports.map(|a| a.symbols).unwrap_or(0),
             imports.map(|a| a.invalid_references).unwrap_or(0),
             imports.is_some_and(|a| a.resolved_iat_suspected),
-            exports.map(|a| a.status).unwrap_or("unavailable"),
+            raw_export,
             exports.map(|a| a.entries).unwrap_or(0),
             exports.map(|a| a.symbols).unwrap_or(0),
-            exports.map(|a| a.invalid_references).unwrap_or(0)));
+            exports.map(|a| a.invalid_references).unwrap_or(0),
+            imports.map(|a| a.bad_names).unwrap_or(0),
+            imports.map(|a| a.bad_table_ranges).unwrap_or(0),
+            imports.map(|a| a.unterminated_tables).unwrap_or(0),
+            imports.map(|a| a.bad_ordinals).unwrap_or(0),
+            exports.map(|a| a.bad_names).unwrap_or(0),
+            exports.map(|a| a.bad_table_ranges).unwrap_or(0),
+            exports.map(|a| a.bad_ordinals).unwrap_or(0),
+            exports.map(|a| a.bad_forwarders).unwrap_or(0),
+            context.is_some(), context.map(|c| c.missing_import).unwrap_or(0),
+            context.map(|c| c.missing_export).unwrap_or(0),
+            context.map(|c| c.missing_file_backed).unwrap_or(0),
+            context.map(|c| c.fallback_pages).unwrap_or(0),
+            effective_import, effective_export, profile.ratio(), incoherent_warning));
         if checked % 500 == 0 { println!("[verify] {} files examined...", checked); }
     }
     fs::write(dir.join("dumpy_existing_validation.tsv"), results)?;
-    println!("[verify] {} images examined; {} failed PE parsing; report={}",
-        checked, invalid, dir.join("dumpy_existing_validation.tsv").display());
+    complete_invalid.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut triage = String::from("file\teffective_imports\teffective_exports\timport_bad_names\timport_bad_ordinals\timport_unterminated_tables\texport_bad_names\texport_bad_table_ranges\texport_bad_forwarders\tfallback_pages\n");
+    for (_, row) in &complete_invalid { triage.push_str(row); }
+    fs::write(dir.join("dumpy_complete_invalid.tsv"), triage)?;
+    println!("[verify] {} images with invalid tables and complete file-backed coverage; triage={}",
+        complete_invalid.len(), dir.join("dumpy_complete_invalid.tsv").display());
+    println!("[verify] {} images examined; {} failed PE parsing; {} matched recovery context; report={}",
+        checked, invalid, matched, dir.join("dumpy_existing_validation.tsv").display());
+    Ok(())
+}
+
+/// Extract exactly one virtual-address candidate, retaining the original
+/// bytes as well as both candidate PE layouts. This is intentionally a
+/// diagnostic operation: no source bytes are rewritten and neither candidate
+/// is claimed coherent solely because a page-table walk succeeded.
+fn probe_image(input: &Path, dtb: u64, base: u64, output: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    if dtb == 0 || dtb & 0xfff != 0 || base == 0 || base & 0xfff != 0 {
+        return Err(Error::new(ErrorKind::InvalidInput,
+            "DTB and virtual base must be nonzero, 4096-byte-aligned addresses"));
+    }
+    let mut file = File::open(input)?;
+    let mut memory = memory::PhysicalMemory::new(&mut file)?;
+    let mut header = vec![0u8; 4096];
+    memory.read_virtual(dtb, base, &mut header, 4)?;
+    let nt = header.get(0x3c..0x40)
+        .map(|v| u32::from_le_bytes(v.try_into().unwrap()) as usize)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "short DOS header"))?;
+    let header_size_at = nt.checked_add(24 + 60)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "NT offset overflow"))?;
+    let header_size = header.get(header_size_at..header_size_at.saturating_add(4))
+        .map(|v| u32::from_le_bytes(v.try_into().unwrap()) as usize)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "header size outside first page"))?;
+    if header_size > rebuild::MAX_IMAGE || header_size < 64 {
+        return Err(Error::new(ErrorKind::InvalidData, "invalid SizeOfHeaders"));
+    }
+    if header_size > header.len() {
+        header.resize(header_size, 0);
+        memory.read_virtual(dtb, base, &mut header, 4)?;
+    }
+    let pe = Pe::parse(&header).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+    let mut source = vec![0u8; pe.size_of_image];
+    let mut unavailable = Vec::<usize>::new();
+    for (index, page) in source.chunks_mut(4096).enumerate() {
+        let address = base.checked_add(index as u64 * 4096)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "virtual page address overflow"))?;
+        if memory.read_virtual(dtb, address, page, 4).is_err() {
+            unavailable.push(index);
+        }
+    }
+    let mapped = pe.recover_mapped(&source)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+    let raw = source.get(..pe.raw_file_size)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "raw view extends past source image"))?;
+    let raw_audit = pe_verify::validate(&pe, raw);
+    let mapped_audit = pe_verify::validate(&pe, &mapped);
+    let raw_profile = coherence::executable_text_profile(&pe, raw);
+    let mapped_profile = coherence::executable_text_profile(&pe, &mapped);
+    let (_, selected_layout) = recovery::choose_layout(&pe, &source)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+    fs::create_dir_all(output)?;
+    for filename in ["source_virtual.bin", "candidate_raw.pe", "candidate_mapped.pe", "probe_report.tsv"] {
+        if output.join(filename).exists() {
+            return Err(Error::new(ErrorKind::AlreadyExists,
+                format!("probe output already exists: {}", output.join(filename).display())));
+        }
+    }
+    // Store raw virtual memory separately so layout hypotheses can be
+    // independently tested without resampling the 19+ GB dump.
+    fs::write(output.join("source_virtual.bin"), &source)?;
+    fs::write(output.join("candidate_raw.pe"), raw)?;
+    fs::write(output.join("candidate_mapped.pe"), &mapped)?;
+    let mut report = String::from("dtb\tbase\tsize_of_image\tmissing_pages\tmissing_page_indices\tselected_layout\traw_imports\traw_descriptors\traw_symbols\traw_exports\tmapped_imports\tmapped_descriptors\tmapped_symbols\tmapped_exports\traw_executable_utf16_ratio\tmapped_executable_utf16_ratio\n");
+    report.push_str(&format!("0x{:x}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\n",
+        dtb, base, pe.size_of_image, unavailable.len(),
+        unavailable.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+        selected_layout,
+        raw_audit.imports.status, raw_audit.imports.entries, raw_audit.imports.symbols,
+        raw_audit.exports.status, mapped_audit.imports.status,
+        mapped_audit.imports.entries, mapped_audit.imports.symbols,
+        mapped_audit.exports.status, raw_profile.ratio(), mapped_profile.ratio()));
+    fs::write(output.join("probe_report.tsv"), report)?;
+    println!("[probe] dtb=0x{:x} base=0x{:x} pages={} unreadable={} layout={} report={}",
+        dtb, base, pe.size_of_image.div_ceil(4096), unavailable.len(),
+        selected_layout, output.join("probe_report.tsv").display());
+    Ok(())
+}
+
+/// Dump an arbitrary virtual range of one address space, page by page.
+/// Non-resident pages are zero-filled and listed in a sidecar TSV so the
+/// output is never mistaken for a contiguous capture.
+fn dump_range(path: &Path, dtb: u64, va: u64, length: u64, output: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    if length == 0 || length > 1 << 30 {
+        return Err(Error::new(ErrorKind::InvalidInput, "length must be 1..=1 GiB"));
+    }
+    let mut file = File::open(path)?;
+    let mut phys = memory::PhysicalMemory::new(&mut file)?;
+    let start = va & !0xfff;
+    let end = va.checked_add(length).ok_or_else(|| Error::new(ErrorKind::InvalidInput, "range overflow"))?
+        .next_multiple_of(4096);
+    let mut bytes = vec![0u8; (end - start) as usize];
+    let mut missing = String::from("virtual_address\treason\n");
+    let mut readable = 0usize;
+    let mut transition = 0usize;
+    for (i, page) in bytes.chunks_mut(4096).enumerate() {
+        let before = phys.transition_translations;
+        match phys.read_virtual(dtb, start + i as u64 * 4096, page, 4) {
+            Ok(()) => { readable += 1; if phys.transition_translations != before { transition += 1; } }
+            Err(e) => missing.push_str(&format!("0x{:x}\t{}\n", start + i as u64 * 4096, e)),
+        }
+    }
+    if let Some(parent) = output.parent() { fs::create_dir_all(parent)?; }
+    fs::write(output, &bytes)?;
+    let sidecar = output.with_extension("missing.tsv");
+    fs::write(&sidecar, missing)?;
+    println!("[dump-range] dtb=0x{dtb:x} va=0x{start:x}..0x{end:x} pages={} readable={} transition={} -> {} (missing pages: {})",
+        bytes.len() / 4096, readable, transition, output.display(), sidecar.display());
     Ok(())
 }
 
@@ -422,12 +668,12 @@ fn extract_virtual(path: &Path, dtb: u64, va: u64, output: &Path, levels: u8) ->
     let pe = Pe::parse(&header).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let mut mapped = vec![0u8; pe.size_of_image];
     phys.read_virtual(dtb, va, &mut mapped, levels)?;
-    // We know this source is a mapped virtual image: do not guess between layouts.
-    let result = pe.recover_mapped(&mapped)
+    // Virtual memory may contain a mapped image view or a raw file view.
+    let (result, layout) = recovery::choose_layout(&pe, &mapped)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if let Some(parent) = output.parent() { fs::create_dir_all(parent)?; }
     fs::write(output, &result)?;
-    println!("Recovered {} bytes; {}", result.len(), pe.directory_report(&result));
+    println!("Recovered {} bytes; layout={}; {}", result.len(), layout, pe.directory_report(&result));
     Ok(())
 }
 
@@ -536,6 +782,48 @@ fn main() {
         }
         return;
     }
+    if args.len() == 6 && args[1] == "--probe-image" {
+        match (hex_number(&args[3].to_string_lossy()),
+               hex_number(&args[4].to_string_lossy())) {
+            (Ok(dtb), Ok(base)) => {
+                if let Err(e) = probe_image(Path::new(&args[2]), dtb, base, Path::new(&args[5])) {
+                    eprintln!("Image probe failed: {e}"); std::process::exit(1);
+                }
+            }
+            (dtb, base) => {
+                eprintln!("Invalid probe addresses: dtb={dtb:?}, base={base:?}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+    if (4..=9).contains(&args.len()) &&
+        (args[1] == "--recover-process-aware" || args[1] == "--process-scan") {
+        let parse_limit = |position: usize, fallback: usize, max: usize| -> usize {
+            if position >= args.len() { return fallback; }
+            match args[position].to_string_lossy().parse::<usize>() {
+                Ok(value) if value > 0 && value <= max => value,
+                _ => { eprintln!("Invalid process scan limit at argument {position}"); std::process::exit(2); }
+            }
+        };
+        let page_limit = parse_limit(4, 100_000, 100_000_000);
+        let root_limit = parse_limit(5, 8, 8192);
+        let root_start = if args.len() >= 7 {
+            match args[6].to_string_lossy().parse::<usize>() {
+                Ok(index) if index < 8192 => index,
+                _ => { eprintln!("Invalid root start index"); std::process::exit(2); }
+            }
+        } else { 0 };
+        let max_recoveries = parse_limit(7, 4096, 1_000_000);
+        let max_module_mib = parse_limit(8, MAX_IMAGE / (1024 * 1024), MAX_IMAGE / (1024 * 1024));
+        let limits = process_aware::Limits { page_limit, root_limit, root_start,
+            max_recoveries, max_module_bytes: max_module_mib as u64 * 1024 * 1024,
+            scan_only: args[1] == "--process-scan" };
+        if let Err(e) = recover_process_aware(Path::new(&args[2]), Path::new(&args[3]), &limits) {
+            eprintln!("Process-aware recovery failed: {e}"); std::process::exit(1);
+        }
+        return;
+    }
     if (4..=7).contains(&args.len()) && args[1] == "--recover-user" {
         let read_limit = |position: usize, maximum: usize, label: &str| -> Option<usize> {
             if position >= args.len() { return None; }
@@ -549,6 +837,18 @@ fn main() {
         let images = read_limit(6, 4096, "max_images_per_root");
         if let Err(e) = recover_user_images(Path::new(&args[2]), Path::new(&args[3]), pages, roots, images) {
             eprintln!("User PE recovery failed: {e}"); std::process::exit(1);
+        }
+        return;
+    }
+    if args.len() == 7 && args[1] == "--dump-range" {
+        match (hex_number(&args[3].to_string_lossy()), hex_number(&args[4].to_string_lossy()),
+               hex_number(&args[5].to_string_lossy())) {
+            (Ok(dtb), Ok(va), Ok(len)) => {
+                if let Err(e) = dump_range(Path::new(&args[2]), dtb, va, len, Path::new(&args[6])) {
+                    eprintln!("Range dump failed: {e}"); std::process::exit(1);
+                }
+            }
+            _ => { eprintln!("Invalid --dump-range arguments; dtb, va and length are hex"); std::process::exit(2); }
         }
         return;
     }
@@ -574,8 +874,12 @@ fn main() {
         eprintln!("       --processes <windows_crash_dump>");
         eprintln!("       --recover-kernel <windows_crash_dump> <output_directory>");
         eprintln!("       --verify-dir <directory_of_recovered_pes>");
+        eprintln!("       --probe-image <dump> <dtb_hex> <image_base_hex> <output_directory>");
+        eprintln!("       --process-scan <dump> <output_dir> [pages_per_root=100000] [roots=8] [root_start=0]");
+        eprintln!("       --recover-process-aware <dump> <output_dir> [pages_per_root=100000] [roots=8] [root_start=0] [max_recoveries=4096] [max_module_mib=600]");
         eprintln!("       --recover-user <dump> <output_directory> [max_mapped_pages] [max_roots] [max_images_per_root]");
         eprintln!("       --virtual <flat_dump> <dtb_hex> <image_base_hex> <output.exe> [4|5]");
+        eprintln!("       --dump-range <dump> <dtb_hex> <va_hex> <length_hex> <output.bin>");
         std::process::exit(2);
     }
     if let Err(err) = run(Path::new(&args[1]), Path::new(&args[2])) {

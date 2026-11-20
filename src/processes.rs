@@ -38,19 +38,28 @@ fn links(mem: &mut PhysicalMemory<'_>, dtb: u64, va: u64) -> io::Result<(u64, u6
 
 fn plausible_name(bytes: &[u8]) -> Option<(String, usize)> {
     // An IMAGE_FILE_NAME field is at most 15 bytes plus the terminating NUL.
-    let mut names = Vec::new();
-    for (index, window) in bytes.windows(16).enumerate() {
-        let Some(end) = window.iter().position(|x| *x == 0) else { continue };
-        if !(4..=15).contains(&end) { continue; }
+    // Once a name is accepted, skip past its terminator: otherwise every
+    // suffix of "example.exe" ("xample.exe", "ample.exe", ...) is also a
+    // well-formed .exe name and the single-candidate rule always fails.
+    let mut names = Vec::<(String, usize)>::new();
+    let mut index = 0usize;
+    while index + 16 <= bytes.len() {
+        let window = &bytes[index..index + 16];
+        let Some(end) = window.iter().position(|x| *x == 0) else { index += 1; continue };
+        if !(4..=15).contains(&end) { index += 1; continue; }
         let text = &window[..end];
         if !text.iter().all(|x| x.is_ascii_alphanumeric() || matches!(*x, b'.' | b'_' | b'-')) {
+            index += 1;
             continue;
         }
         let value = String::from_utf8_lossy(text).into_owned();
         if value.to_ascii_lowercase().ends_with(".exe") || matches!(value.as_str(), "System" | "Registry") {
-            if !names.iter().any(|item: &(String, usize)| item.0 == value) {
+            if !names.iter().any(|item| item.0 == value) {
                 names.push((value, index));
             }
+            index += end + 1;
+        } else {
+            index += 1;
         }
     }
     if names.len() == 1 { names.into_iter().next() } else { None }
@@ -169,5 +178,12 @@ mod tests {
         let mut data = [0u8; 96];
         data[32..46].copy_from_slice(b"exampleapp.exe");
         assert_eq!(plausible_name(&data), Some(("exampleapp.exe".into(), 32)));
+    }
+    #[test]
+    fn two_distinct_names_remain_ambiguous() {
+        let mut data = [0u8; 96];
+        data[16..25].copy_from_slice(b"first.exe");
+        data[48..58].copy_from_slice(b"second.exe");
+        assert_eq!(plausible_name(&data), None);
     }
 }
