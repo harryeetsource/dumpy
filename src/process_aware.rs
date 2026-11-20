@@ -229,6 +229,7 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, pid_by_dtb: &HashMap<u6
     let mut physical = PhysicalMemory::new(&mut file)?;
     fs::create_dir_all(output)?;
     let end_root = limits.root_start.saturating_add(limits.root_limit).min(roots.len());
+    println!("[process-aware] dumpy {} ", crate::VERSION);
     println!("[process-aware] {} roots discovered; scanning indices {}..{} pages/root={} mode={}",
         roots.len(), limits.root_start, end_root, limits.page_limit,
         if limits.scan_only { "discovery-only" } else { "bounded-recovery" });

@@ -19,6 +19,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
+/// Bumped on every report-format change so a log line identifies the build.
+pub const VERSION: &str = "0.6.0 (2026-11-20 content_class/first_page_physical/resource-only)";
+
 fn hex_number(s: &str) -> Result<u64, String> {
     let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
     u64::from_str_radix(trimmed, 16).map_err(|e| format!("invalid hexadecimal value {s}: {e}"))
@@ -748,6 +751,10 @@ fn run(input: &Path, output: &Path) -> std::io::Result<()> {
 
 fn main() {
     let args: Vec<_> = std::env::args_os().collect();
+    if args.len() == 2 && args[1] == "--version" {
+        println!("dumpy {VERSION}");
+        return;
+    }
     if args.len() == 3 && args[1] == "--info" {
         if let Err(e) = inspect_dump(Path::new(&args[2])) { eprintln!("Inspection failed: {e}"); std::process::exit(1); }
         return;
