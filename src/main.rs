@@ -6,12 +6,14 @@ mod kernel_modules;
 mod memory;
 mod offline_coverage;
 mod peb;
+mod eprocess;
 mod process_aware;
 mod processes;
 mod pe_verify;
 mod recovery;
 mod rebuild;
 mod user_images;
+mod vad;
 
 use rebuild::{Pe, MAX_IMAGE};
 use std::collections::{HashMap, HashSet};
@@ -20,7 +22,7 @@ use std::io::Write;
 use std::path::Path;
 
 /// Bumped on every report-format change so a log line identifies the build.
-pub const VERSION: &str = "0.6.0 (2026-11-20 content_class/first_page_physical/resource-only)";
+pub const VERSION: &str = "0.12.0 (2026-11-23 code-complete tier: headers+code+tables from memory -> .code-complete.pe)";
 
 fn hex_number(s: &str) -> Result<u64, String> {
     let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
@@ -196,8 +198,9 @@ fn recover_user_images(path: &Path, output: &Path, maximum_pages: Option<usize>,
 /// A coherent root cohort is needed for tentative flat-physical acquisitions.
 /// Matching kernel mappings are evidence, not definitive acquisition metadata.
 fn coherent_raw_roots(physical: &mut memory::PhysicalMemory<'_>)
-    -> std::io::Result<Vec<discovery::RootCandidate>> {
+    -> std::io::Result<(Vec<discovery::RootCandidate>, Option<u64>)> {
     let roots = discovery::discover_candidate_roots(physical, 8192)?;
+    let kernel_root = roots.iter().max_by_key(|r| (r.kernel_entries, r.user_entries)).map(|r| r.physical);
     println!("[raw] Structural PML4 candidates: {}", roots.len());
     // A shared kernel PML4 entry provides a cross-root consistency check.
     // Ignore the self-reference itself; it would only confirm each root alone.
@@ -229,7 +232,7 @@ fn coherent_raw_roots(physical: &mut memory::PhysicalMemory<'_>)
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
             "coherent roots have no present user mappings; physical layout unverified"));
     }
-    Ok(candidates)
+    Ok((candidates, kernel_root))
 }
 
 /// The acquisition format is unknown. Only attempt a tentative flat-physical
@@ -241,7 +244,8 @@ fn recover_raw_user_images(file: &mut File, output: &Path,
     println!("[raw] Unknown acquisition format; probing for flat physical-address mapping.");
     println!("[raw] File offsets are tentatively treated as physical addresses; results require independent validation.");
     let mut physical = memory::PhysicalMemory::new(file)?;
-    let candidates = coherent_raw_roots(&mut physical)?;
+    let (candidates, kernel_root) = coherent_raw_roots(&mut physical)?;
+    physical.kernel_root = kernel_root;
     println!("[raw] Consistent page-table cohort: {} user-capable roots", candidates.len());
     let max_raw_roots = max_roots.unwrap_or(32);
     const DEFAULT_RAW_PAGES: usize = 100_000;
@@ -358,8 +362,9 @@ fn recover_process_aware(input: &Path, output: &Path, limits: &process_aware::Li
     } else { None };
     let mut physical = memory::PhysicalMemory::new(&mut file)?;
     let mut pid_by_dtb = HashMap::<u64, (String, String)>::new();
-    let mut roots = if let Some(info) = &crash {
+    let (mut roots, kernel_root) = if let Some(info) = &crash {
         let roots = discovery::discover_candidate_roots(&mut physical, 8192)?;
+        let kernel_root = roots.iter().max_by_key(|r| (r.kernel_entries, r.user_entries)).map(|r| r.physical);
         if info.dtb != 0 && info.active_process_head != 0 {
             match processes::enumerate(&mut physical, info.dtb, info.active_process_head,
                                         &roots, 65536) {
@@ -380,7 +385,7 @@ fn recover_process_aware(input: &Path, output: &Path, limits: &process_aware::Li
                 Err(e) => eprintln!("[process-aware] kernel process list unavailable: {e}"),
             }
         }
-        roots.into_iter().filter(|r| r.user_entries > 0).collect::<Vec<_>>()
+        (roots.into_iter().filter(|r| r.user_entries > 0).collect::<Vec<_>>(), kernel_root)
     } else {
         println!("[process-aware] Unknown dump type; using only coherent tentative flat roots");
         coherent_raw_roots(&mut physical)?
@@ -392,7 +397,7 @@ fn recover_process_aware(input: &Path, output: &Path, limits: &process_aware::Li
             format!("root start {} exceeds discovered root count {}", limits.root_start, roots.len())));
     }
     drop(physical);
-    process_aware::run(input, output, roots.into_iter().map(|r| r.physical).collect(),
+    process_aware::run(input, output, roots.into_iter().map(|r| r.physical).collect(), kernel_root,
         &pid_by_dtb, limits)
 }
 
@@ -457,8 +462,8 @@ fn verify_existing_images(dir: &Path) -> std::io::Result<()> {
     for entry in entries {
         if !entry.file_type()?.is_file() { continue; }
         let file_name = entry.file_name().to_string_lossy().into_owned();
-        if !file_name.ends_with(".recovered.pe") && !file_name.ends_with(".partial.bin") &&
-            !file_name.ends_with(".merged.bin") { continue; }
+        if !file_name.ends_with(".recovered.pe") && !file_name.ends_with(".code-complete.pe") &&
+            !file_name.ends_with(".partial.bin") && !file_name.ends_with(".merged.bin") { continue; }
         let metadata = entry.metadata()?;
         if metadata.len() > MAX_IMAGE as u64 { continue; }
         let image = fs::read(entry.path())?;
@@ -610,6 +615,187 @@ fn probe_image(input: &Path, dtb: u64, base: u64, output: &Path) -> std::io::Res
     println!("[probe] dtb=0x{:x} base=0x{:x} pages={} unreadable={} layout={} report={}",
         dtb, base, pe.size_of_image.div_ceil(4096), unavailable.len(),
         selected_layout, output.join("probe_report.tsv").display());
+    Ok(())
+}
+
+/// `--eprocess-scan`: find _EPROCESS objects without symbols, anchored on
+/// the DTB/PEB pairs an earlier process-aware run validated, and fill the
+/// PID / parent / name / time columns of dumpy_processes.tsv in place.
+fn eprocess_scan(input: &Path, out_dir: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let processes_path = out_dir.join("dumpy_processes.tsv");
+    let text = fs::read_to_string(&processes_path).map_err(|e|
+        Error::new(ErrorKind::NotFound, format!("{}: {e}; run --recover-process-aware first", processes_path.display())))?;
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap_or("").split('\t').collect();
+    let col = |name: &str| header.iter().position(|h| *h == name);
+    let (Some(c_dtb), Some(c_peb), Some(c_bits)) = (col("dtb"), col("peb"), col("bitness")) else {
+        return Err(Error::new(ErrorKind::InvalidData, "dumpy_processes.tsv lacks dtb/peb/bitness columns"));
+    };
+    let hex = |v: &str| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok();
+    let mut anchors = HashMap::<u64, Vec<u64>>::new();
+    let rows: Vec<Vec<String>> = lines.map(|l| l.split('\t').map(str::to_owned).collect()).collect();
+    for row in &rows {
+        let (Some(dtb), Some(peb)) = (row.get(c_dtb).and_then(|v| hex(v)), row.get(c_peb).and_then(|v| hex(v))) else { continue };
+        let entry = anchors.entry(dtb).or_default();
+        if row.get(c_bits).map(String::as_str) == Some("64") { entry.insert(0, peb); } else { entry.push(peb); }
+    }
+    let mut file = File::open(input)?;
+    let mut physical = memory::PhysicalMemory::new(&mut file)?;
+    let roots = discovery::discover_candidate_roots(&mut physical, 8192)?;
+    let mut live: std::collections::HashSet<u64> = roots.iter().map(|r| r.physical).collect();
+    live.extend(anchors.keys().copied());
+    let kernel_root = roots.iter().max_by_key(|r| (r.kernel_entries, r.user_entries)).map(|r| r.physical);
+    physical.kernel_root = kernel_root;
+    println!("[eprocess] anchors={} live roots={} kernel root={}", anchors.len(), live.len(),
+        kernel_root.map(|r| format!("0x{r:x}")).unwrap_or_else(|| "none".into()));
+    let report = eprocess::scan(&mut physical, &live, &anchors, kernel_root)?;
+    let l = &report.layout;
+    let show = |v: Option<i64>| v.map(|d| format!("{:+#x}", d)).unwrap_or_else(|| "?".into());
+    println!("[eprocess] PEB distance candidates (distance:support): {}",
+        report.peb_delta_candidates.iter().map(|(d, c)| format!("{d:+#x}:{c}")).collect::<Vec<_>>().join(" "));
+    for ((d, support, confirmed, ok), attempt) in report.layout_attempts.iter().zip(&report.attempt_layouts) {
+        println!("[eprocess]   tried {d:+#x} support={support} confirmed={confirmed} distinct={} layout={} scores: {}",
+            attempt.distinct_objects, if *ok { "learned" } else { "incomplete" },
+            attempt.scores.iter().map(|(f, c, o)| format!("{f}={c}@{o:+#x}")).collect::<Vec<_>>().join(" "));
+    }
+    println!("[eprocess] dtb hits={} rejected={} confirmed={} shape candidates={} objects={}",
+        report.dtb_hits, report.rejected_hits, l.confirmed_objects, report.shape_candidates, report.processes.len());
+    println!("[eprocess] kernel-CR3 evidence (UserDirectoryTableBase offset tried: PML4-shaped/tried, read virtually): {}",
+        l.field_evidence.iter().map(|(o, h, t)| format!("{o:#x}:{h}/{t}")).collect::<Vec<_>>().join(" "));
+    println!("[eprocess] DISPATCHER_HEADER Type=3 at field-0x28: {}/{} objects (field is KPROCESS.DirectoryTableBase when this holds)",
+        l.dispatcher_header_evidence.0, l.dispatcher_header_evidence.1);
+    if l.pid.is_none() || l.field_offset != 0x28 { for line in &report.head_dumps { println!("[eprocess]   {line}"); } }
+    println!("[eprocess] matched DTB field at EPROCESS+{:#x} ({}); offsets relative to it: peb={} pid={} links={} ppid={} create={} name={}",
+        l.field_offset, if l.field_offset == 0x28 { "DirectoryTableBase; KPROCESS size follows from UniqueProcessId" } else { "UserDirectoryTableBase: KVA shadowing, roots are user CR3s" },
+        show(l.peb), show(l.pid), show(l.links), show(l.ppid), show(l.create_time), show(l.name));
+    if l.pid.is_some() {
+        let abs = |v: Option<i64>| v.map(|d| format!("{:#x}", d + l.field_offset as i64)).unwrap_or_else(|| "?".into());
+        println!("[eprocess] absolute EPROCESS offsets: Peb={} UniqueProcessId={} ActiveProcessLinks={} InheritedFrom={} CreateTime={} ExitTime={} ImageFileName={}",
+            abs(l.peb), abs(l.pid), abs(l.links), abs(l.ppid), abs(l.create_time), abs(l.exit_time), abs(l.name));
+    }
+    if let Some(dbg) = &report.debug {
+        println!("[eprocess] debug: pid {} has {} object(s); offsets differing between the first two (relative to the DTB field): {}",
+            dbg.pid, dbg.windows.len(), dbg.differing_offsets.iter().map(|o| format!("{o:+#x}")).collect::<Vec<_>>().join(" "));
+        for (phys, bytes) in &dbg.windows {
+            let path = out_dir.join(format!("eprocess_debug_0x{phys:x}.bin"));
+            fs::write(&path, bytes)?;
+            println!("[eprocess] debug: wrote {} ({} bytes, starts at field-0x40)", path.display(), bytes.len());
+            // Qword table of the first 0x340 bytes after the field.
+            let mut line = String::new();
+            for (i, chunk) in bytes[0x40..bytes.len().min(0x380)].chunks(8).enumerate() {
+                let v = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+                line.push_str(&format!("{:+#05x}={v:#018x} ", i * 8));
+                if i % 4 == 3 { println!("[eprocess]   {line}"); line.clear(); }
+            }
+            if !line.is_empty() { println!("[eprocess]   {line}"); }
+        }
+    }
+    if report.processes.is_empty() {
+        return Err(Error::new(ErrorKind::NotFound, "no EPROCESS objects confirmed; the PEB offset could not be learned"));
+    }
+    let dups = report.processes.iter().filter(|p| p.duplicate_of.is_some()).count();
+    if dups > 0 {
+        println!("[eprocess] {} objects are duplicates of another (same PID and CreateTime); physical spacing (bytes:count): {}",
+            dups, report.duplicate_spacing.iter().map(|(d, c)| format!("0x{d:x}:{c}")).collect::<Vec<_>>().join(" "));
+        if report.duplicate_spacing.first().is_some_and(|(_, c)| *c * 2 > dups) {
+            println!("[eprocess]   one spacing dominates: a region of this capture appears twice at different times (acquisition artefact), not kernel-side copies");
+        }
+    }
+    // Objects that only contain a DTB value but do not read as a process
+    // (PFN lists, pool copies) go to a sidecar so the main table is the
+    // process list. DUMPY_EPROCESS_ALL=1 keeps them in the main table.
+    let keep_all = std::env::var_os("DUMPY_EPROCESS_ALL").is_some();
+    let lookalikes = report.processes.iter().filter(|p| !p.plausible).count();
+    if lookalikes > 0 {
+        println!("[eprocess] {lookalikes} dtb-anchored objects do not read as processes (implausible pid/ppid/time/name); {}",
+            if keep_all { "kept in dumpy_eprocess.tsv" } else { "written to dumpy_eprocess_lookalikes.tsv" });
+    }
+    let ep_header = "source\tstate\tpid\tppid\tname\tdtb\tother_dtb\tlive_address_space\tcreate_time_utc\texit_time_utc\tin_active_list\tgroup_linked\teprocess_va\teprocess_phys\tpeb\tpeb_confirmed\tduplicate_of\tplausible\n";
+    let mut out = String::from(ep_header);
+    let mut side = String::from(ep_header);
+    for p in &report.processes {
+        let dst = if p.plausible || keep_all { &mut out } else { &mut side };
+        // Root found in RAM is not the same as process alive: a freed PML4
+        // page keeps its self-reference until reused.
+        let state = match (p.exit_time.is_some(), p.live_root, report.layout.exit_time.is_some()) {
+            (true, _, _) if p.exit_from_duplicate => "exited(this copy imaged before exit)",
+            (true, true, _) => "exited(page tables still in RAM)",
+            (true, false, _) => "exited",
+            (false, true, _) => "running",
+            (false, false, true) => "no-exit-time,root-missing",
+            (false, false, false) => "root-missing",
+        };
+        dst.push_str(&format!("{}\t{}\t{}\t{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0x{:x}\t0x{:x}\t{}\t{}\t{}\n",
+            p.source, state, p.pid.map(|v| v.to_string()).unwrap_or_default(), p.ppid.map(|v| v.to_string()).unwrap_or_default(),
+            p.name.clone().unwrap_or_default().replace('\t', " "), p.dtb,
+            p.other_dtb.map(|v| format!("0x{v:x}")).unwrap_or_default(), p.live_root,
+            p.create_time.map(eprocess::filetime_iso).unwrap_or_default(),
+            p.exit_time.map(eprocess::filetime_iso).unwrap_or_default(),
+            p.in_active_list.map(|v| v.to_string()).unwrap_or_default(),
+            p.group_linked.map(|v| v.to_string()).unwrap_or_default(),
+            p.eprocess_va.map(|v| format!("0x{v:x}")).unwrap_or_default(),
+            p.physical.saturating_sub(report.layout.field_offset), p.peb, p.peb_confirmed,
+            p.duplicate_of.map(|d| format!("0x{:x}", d.saturating_sub(report.layout.field_offset))).unwrap_or_default(),
+            p.plausible));
+    }
+    fs::write(out_dir.join("dumpy_eprocess.tsv"), &out)?;
+    if !keep_all && lookalikes > 0 { fs::write(out_dir.join("dumpy_eprocess_lookalikes.tsv"), &side)?; }
+    // Fill pid/name hints in dumpy_processes.tsv and append the new columns.
+    let mut by_dtb: HashMap<u64, &eprocess::Process> = HashMap::new();
+    for p in report.processes.iter().filter(|p| p.source == "dtb-anchored" && p.plausible) {
+        let e = by_dtb.entry(p.dtb).or_insert(p);
+        // Prefer the copy that is linked and PEB-confirmed over the first-seen copy.
+        let score = |q: &eprocess::Process| (q.in_active_list == Some(true)) as u8 * 2 + q.peb_confirmed as u8;
+        if score(p) > score(e) { *e = p; }
+    }
+    let (c_pid, c_name) = (col("pid_hint"), col("name_hint"));
+    let mut rewritten = header.join("\t") + "\tppid\tcreate_time_utc\texit_time_utc\tin_active_list\tstate\n";
+    for row in &rows {
+        let mut row = row.clone();
+        let p = row.get(c_dtb).and_then(|v| hex(v)).and_then(|d| by_dtb.get(&d));
+        let state = match p {
+            Some(p) if p.exit_time.is_some() => "exited(page tables still in RAM)",
+            Some(_) => "running",
+            None => "",
+        };
+        let (ppid, create, exit, linked) = match p {
+            Some(p) => {
+                if let (Some(c), Some(pid)) = (c_pid, p.pid) { if c < row.len() { row[c] = pid.to_string(); } }
+                if let (Some(c), Some(n)) = (c_name, &p.name) { if c < row.len() { row[c] = n.clone(); } }
+                (p.ppid.map(|v| v.to_string()).unwrap_or_default(),
+                 p.create_time.map(eprocess::filetime_iso).unwrap_or_default(),
+                 p.exit_time.map(eprocess::filetime_iso).unwrap_or_default(),
+                 p.group_linked.or(p.in_active_list).map(|v| v.to_string()).unwrap_or_default())
+            }
+            None => (String::new(), String::new(), String::new(), String::new()),
+        };
+        rewritten.push_str(&format!("{}\t{ppid}\t{create}\t{exit}\t{linked}\t{state}\n", row.join("\t")));
+    }
+    fs::write(&processes_path, rewritten)?;
+    let exited = report.processes.iter().filter(|p| p.exit_time.is_some()).count();
+    let dead_scanned = rows.iter().filter(|row| row.get(c_dtb).and_then(|v| hex(v)).and_then(|d| by_dtb.get(&d)).is_some_and(|p| p.exit_time.is_some())).count();
+    println!("[eprocess] {dead_scanned} rows of dumpy_processes.tsv belong to exited processes (marked state=exited); exited address spaces usually have no PEB left and so no row");
+    // Only PEB-confirmed, non-duplicate objects can be meaningfully "unlinked".
+    let unlinked = report.processes.iter().filter(|p| p.group_linked == Some(false) && p.exit_time.is_none() &&
+        p.live_root && p.peb_confirmed && p.duplicate_of.is_none()).count();
+    let linked = report.processes.iter().filter(|p| p.in_active_list == Some(true)).count();
+    println!("[eprocess] ActiveProcessLinks resolved for {linked} objects");
+    if report.layout.exit_time.is_none() {
+        println!("[eprocess] ExitTime offset not learned ({} plausible objects have no live address space); exit_time_utc is empty, not zero", report.exit_dead_total);
+        for l in &report.after_create { println!("[eprocess]   qwords from CreateTime on a dead object: {l}"); }
+        if let Some((s, nz, nd, ord, n)) = report.exit_next_qword {
+            println!("[eprocess]   CreateTime+8 (usual ExitTime slot): shaped={s}/{n} nonzero={nz} nonzero-among-dead={nd} exit>=create={ord}");
+        }
+    } else {
+        if let Some((s, nz, nd, ord, n)) = report.exit_next_qword {
+            println!("[eprocess] CreateTime+8 (usual ExitTime slot): shaped={s}/{n} nonzero={nz} nonzero-among-dead={nd} exit>=create={ord}");
+        }
+        for l in &report.after_create { println!("[eprocess]   qwords from CreateTime on a dead object: {l}"); }
+        println!("[eprocess] ExitTime candidates (delta:nonzero/nonzero-among-dead of {}): {}", report.exit_dead_total,
+            report.exit_candidates.iter().map(|(d, nz, nd)| format!("+{d:#x}:{nz}/{nd}")).collect::<Vec<_>>().join(" "));
+    }
+    println!("[eprocess] wrote {}; exited={} live-but-unlinked(per duplicate group)={}", out_dir.join("dumpy_eprocess.tsv").display(), exited, unlinked);
     Ok(())
 }
 
@@ -847,6 +1033,12 @@ fn main() {
         }
         return;
     }
+    if args.len() == 4 && args[1] == "--eprocess-scan" {
+        if let Err(e) = eprocess_scan(Path::new(&args[2]), Path::new(&args[3])) {
+            eprintln!("EPROCESS scan failed: {e}"); std::process::exit(1);
+        }
+        return;
+    }
     if args.len() == 7 && args[1] == "--dump-range" {
         match (hex_number(&args[3].to_string_lossy()), hex_number(&args[4].to_string_lossy()),
                hex_number(&args[5].to_string_lossy())) {
@@ -887,6 +1079,7 @@ fn main() {
         eprintln!("       --recover-user <dump> <output_directory> [max_mapped_pages] [max_roots] [max_images_per_root]");
         eprintln!("       --virtual <flat_dump> <dtb_hex> <image_base_hex> <output.exe> [4|5]");
         eprintln!("       --dump-range <dump> <dtb_hex> <va_hex> <length_hex> <output.bin>");
+        eprintln!("       --eprocess-scan <dump> <output_dir>   (after --recover-process-aware; fills PID/name)");
         std::process::exit(2);
     }
     if let Err(err) = run(Path::new(&args[1]), Path::new(&args[2])) {

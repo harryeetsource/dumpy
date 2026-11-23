@@ -123,8 +123,12 @@ fn recover_identity(mem: &mut PhysicalMemory<'_>, key: Key, identity: &Identity,
                     dir: &Path, status: &'static str)
                     -> io::Result<recovery::RecoveryRecord> {
     let (base, size, _) = key;
+    // The System address space has no user image mappings of its own; a
+    // user page that translates through it is a stale entry, never a source.
+    let kernel_root = mem.kernel_root;
     let mut dtbs = identity.listed_in.iter().chain(identity.seen_in.iter())
-        .copied().collect::<Vec<_>>();
+        .copied().filter(|d| Some(*d) != kernel_root).collect::<Vec<_>>();
+    if dtbs.is_empty() { dtbs = identity.listed_in.iter().chain(identity.seen_in.iter()).copied().collect(); }
     dtbs.sort_unstable();
     dtbs.dedup();
     let mut ranked = dtbs.into_iter()
@@ -223,10 +227,23 @@ fn build_page_index(sources: &[(String, PathBuf)]) -> HashMap<u64, (String, u32)
     index
 }
 
-pub fn run(input: &Path, output: &Path, roots: Vec<u64>, pid_by_dtb: &HashMap<u64, (String, String)>,
-           limits: &Limits) -> io::Result<()> {
+pub fn run(input: &Path, output: &Path, roots: Vec<u64>, kernel_root: Option<u64>,
+           pid_by_dtb: &HashMap<u64, (String, String)>, limits: &Limits) -> io::Result<()> {
     let mut file = fs::File::open(input)?;
     let mut physical = PhysicalMemory::new(&mut file)?;
+    physical.kernel_root = kernel_root;
+    println!("[process-aware] kernel root {} (prototype PTEs {})",
+        kernel_root.map(|k| format!("0x{k:x}")).unwrap_or_else(|| "unknown".into()),
+        if kernel_root.is_some() && physical.allow_transition { "followed" } else { "not followed" });
+    if physical.allow_transition {
+        let r = crate::vad::setup(&mut physical, output);
+        match (r.root_offset, r.first_proto_offset) {
+            (Some(root), Some(fp)) => println!(
+                "[vad] EPROCESS.VadRoot=+{root:#x} (trees covering PEB {}/{}, {} nodes) MMVAD.FirstPrototypePte=+{fp:#x} ({}/{} PFN matches); installed for {} of {} address spaces",
+                r.root_support.0, r.root_support.1, r.nodes, r.proto_matches.0, r.proto_matches.1, r.installed, r.candidates),
+            _ => println!("[vad] VAD resolution off: {}", r.note),
+        }
+    }
     fs::create_dir_all(output)?;
     let end_root = limits.root_start.saturating_add(limits.root_limit).min(roots.len());
     println!("[process-aware] dumpy {} ", crate::VERSION);
@@ -247,16 +264,20 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, pid_by_dtb: &HashMap<u6
 
     // ── Phase 1: scan ──────────────────────────────────────────────────
     let mut scans = Vec::<RootScan>::new();
-    let mut manifest = String::from("dtb\tpeb\tbitness\timage_base\tpid_hint\tname_hint\tldr\tmodules\tldr_entries\tldr_complete\tskipped_headers\tknown_identity_headers\tpass\treadable_pages\tprivate_rw_pages\tteb_hits\ttransition_pages\ttruncated\n");
+    let mut manifest = String::from("dtb\tpeb\tbitness\timage_base\tpid_hint\tname_hint\tldr\tmodules\tldr_entries\tldr_complete\tskipped_headers\tknown_identity_headers\tpass\treadable_pages\tprivate_rw_pages\tteb_hits\ttransition_pages\ttruncated\twow64_peer\n");
     let mut seen_pebs = HashSet::<u64>::new();
     let mut reject_reasons = HashMap::<&'static str, usize>::new();
+    // A WOW64 process has a PEB64 and a PEB32 in the same address space for
+    // the same image; report both, cross-linked, rather than as two processes.
     let manifest_row = |manifest: &mut String, dtb: u64, process: &peb::PebProcess, scan: &ScanResult, pass: u8| {
         let (pid, name) = pid_by_dtb.get(&dtb).cloned().unwrap_or_else(|| ("unknown".into(), "unknown".into()));
-        manifest.push_str(&format!("0x{dtb:x}\t0x{:x}\t{}\t0x{:x}\t{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        let peer = scan.processes.iter().find(|o| o.peb != process.peb && o.image_base == process.image_base &&
+            o.bitness != process.bitness).map(|o| format!("0x{:x}", o.peb)).unwrap_or_default();
+        manifest.push_str(&format!("0x{dtb:x}\t0x{:x}\t{}\t0x{:x}\t{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             process.peb, process.bitness, process.image_base, pid, clean(&name), process.ldr,
             process.modules.len(), process.ldr_entries, process.ldr_complete, process.skipped_headers,
             process.modules.iter().filter(|m| m.header_from_known_identity).count(), pass,
-            scan.readable_pages, scan.private_rw_pages, scan.teb_hits, scan.transition_pages, scan.truncated));
+            scan.readable_pages, scan.private_rw_pages, scan.teb_hits, scan.transition_pages, scan.truncated, peer));
     };
     for (index, dtb) in roots.iter().enumerate().skip(limits.root_start).take(limits.root_limit) {
         println!("[process-aware] root {}/{} dtb=0x{dtb:x} scanning", index + 1, roots.len());
@@ -437,6 +458,16 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, pid_by_dtb: &HashMap<u6
         keys.sort_unstable(); keys.dedup();
         for key in keys { recover(&mut physical, key, "PE header, no loader list in address space", &mut attempted, &mut records, &mut skipped)?; }
         if !records.is_empty() {
+            // Why pages are missing, by mechanism: tells which resolver to build next.
+            let mut reasons = HashMap::<String, usize>::new();
+            for r in &records { for (_, why) in &r.missing_pages { *reasons.entry(why.clone()).or_default() += 1; } }
+            let mut reasons = reasons.into_iter().collect::<Vec<_>>();
+            reasons.sort_by(|a, b| b.1.cmp(&a.1));
+            let total: usize = reasons.iter().map(|r| r.1).sum();
+            println!("[missing-census] {total} missing pages in this batch:");
+            for (why, n) in reasons.iter().take(12) {
+                println!("[missing-census]   {n:>8} ({:>5.1}%) {why}", 100.0 * *n as f64 / total.max(1) as f64);
+            }
             let batch_dir = shared_dir.join(format!("batch_{batch}"));
             recovery::write_report(&batch_dir, &records)?;
             // Merge every batch's reports into images/ so --verify-dir works.
@@ -587,20 +618,28 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, pid_by_dtb: &HashMap<u6
         format!("{name}+0x{rva:x} ({count}/{sampled})")
     };
     let all_dtbs = scans.iter().map(|r| r.dtb).collect::<Vec<_>>();
+    let capture_end = physical.segments().iter().map(|s| s.physical + s.length).max().unwrap_or(u64::MAX);
     // Managed/JIT runtimes allocate executable heaps with no PE header; name
     // the runtime so such regions can be triaged as expected rather than foreign.
     let runtime_hint = |root: &RootScan| -> String {
         let mut hints = BTreeSet::new();
         for process in &root.scan.processes {
+            let main_size = process.modules.iter().find(|m| m.base == process.image_base).map(|m| m.size).unwrap_or(0);
             for module in &process.modules {
                 let n = module.name.to_ascii_lowercase();
-                let hint = if n == "coreclr.dll" { "dotnet-core" } else if n == "clr.dll" || n == "mscorwks.dll" { "dotnet-framework" }
+                let hint = if n == "coreclr.dll" || n == "hostpolicy.dll" || n == "clrjit.dll" || n == "system.private.corelib.dll" { "dotnet-core" }
+                    else if n == "clr.dll" || n == "mscorwks.dll" || n == "mscoreei.dll" { "dotnet-framework" }
+                    else if n.starts_with("system.") && n.ends_with(".dll") { "dotnet" } // self-contained apps: no coreclr.dll
                     else if n == "msedge.dll" || n == "chrome.dll" || n == "msedgewebview2.exe" { "chromium-v8" }
+                    else if n.ends_with(".node") || n == "ffmpeg.dll" && main_size > 64 << 20 { "electron-v8" }
                     else if n == "jscript9.dll" || n == "chakra.dll" || n == "chakracore.dll" { "jscript" }
-                    else if n == "jvm.dll" { "jvm" } else if n.starts_with("umppc") { "crowdstrike-umppc" } else { continue };
+                    else if n == "jvm.dll" { "jvm" } else if n.starts_with("umppc") { "crowdstrike-umppc" }
+                    else if n == "libcef.dll" { "cef-v8" } else { continue };
                 hints.insert(hint);
             }
         }
+        // "dotnet" is implied by the more specific tags.
+        if hints.contains("dotnet-core") || hints.contains("dotnet-framework") { hints.remove("dotnet"); }
         hints.into_iter().collect::<Vec<_>>().join(",")
     };
     let mut orphans = String::from("dtb\tpebs_in_root\tprocess_runtime\tstart\tspan_bytes\texecutable_pages\treadable_pages\tlarge_page\tfirst_page_physical\tcontent_class\toverlaps_known_module\tcontent_match\tprobable_base\tprobable_base_status\toutput\n");
@@ -675,8 +714,11 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, pid_by_dtb: &HashMap<u6
             // Physical address behind the first page: equal across processes
             // means a shared section; different with identical content means
             // the capture is not internally consistent.
-            let first_physical = physical.translate(root.dtb, region.start, 4)
-                .map(|p| format!("0x{p:x}")).unwrap_or_default();
+            let first_physical = match physical.translate(root.dtb, region.start, 4) {
+                Ok(p) if p >= capture_end => format!("0x{p:x} (beyond capture: stale PTE)"),
+                Ok(p) => format!("0x{p:x}"),
+                Err(_) => String::new(),
+            };
             let content_class = classify_pages(&classified);
             // A run starting one page past a 64 KiB boundary is usually a DLL
             // whose header page is NX or not resident here.

@@ -36,6 +36,21 @@ pub enum EntryKind {
     /// The PFN still names a physical page (standby/modified list) whose
     /// contents are the last state of that virtual page.
     Transition,
+    /// Windows prototype-pointer PTE (Valid=0, Prototype=1): the process has
+    /// not touched this shared page yet, so its PTE points at the section's
+    /// prototype PTE in kernel memory, which in turn names the physical page
+    /// every mapper of the file shares. Resolved through the kernel root.
+    Prototype,
+    /// No PTE at all; resolved through the process's VAD tree to the
+    /// section's prototype PTE (shared page the process never touched).
+    Vad,
+}
+
+/// Per-address-space VAD roots plus the learned MMVAD.FirstPrototypePte
+/// offset; see `vad.rs`.
+pub struct VadState {
+    pub roots: std::collections::HashMap<u64, u64>,
+    pub first_proto_offset: u64,
 }
 
 /// Accept hardware-present entries and, when enabled, Windows transition
@@ -53,6 +68,19 @@ pub fn classify_entry(entry: u64, allow_transition: bool) -> Option<EntryKind> {
     None
 }
 
+/// Name the reason a non-present entry stops a walk, so missing-page reports
+/// say which mechanism would recover the page.
+fn describe_absent(entry: u64, level: u8) -> String {
+    let name = match level { 5 => "PML5", 4 => "PML4", 3 => "PDPT", 2 => "PD", _ => "PT" };
+    let kind = if entry == 0 { "zero: never touched, VAD/section only" }
+        else if entry & (1 << 10) != 0 { "prototype bit above PT level" }
+        else if entry & (1 << 11) != 0 { "transition with null PFN" }
+        else if entry >> 32 != 0 { "pagefile" }
+        else if entry & 0x3e0 != 0 && entry >> 12 == 0 { "demand zero (protection only)" }
+        else { "other software PTE" };
+    format!("page not present ({name} {kind})")
+}
+
 pub struct PhysicalMemory<'a> {
     file: &'a mut File,
     segments: Vec<crashdump::Segment>,
@@ -62,6 +90,20 @@ pub struct PhysicalMemory<'a> {
     /// transition entry. Callers snapshot this around a read to attribute
     /// provenance to recovered bytes.
     pub transition_translations: u64,
+    /// Page-table root that maps kernel space (System process CR3). Needed
+    /// to follow prototype-pointer PTEs; None disables that.
+    pub kernel_root: Option<u64>,
+    /// Translations that resolved a leaf PTE through a prototype PTE.
+    pub prototype_translations: u64,
+    /// Highest physical address + 1 covered by the capture; used to detect
+    /// swizzled PFNs in software PTEs.
+    top_of_memory: u64,
+    following_prototype: bool,
+    /// VAD fallback for user pages with no PTE; None until `vad::setup`.
+    pub vad: Option<VadState>,
+    /// Translations resolved through a VAD.
+    pub vad_translations: u64,
+    last_absent_zero: bool,
 }
 
 impl<'a> PhysicalMemory<'a> {
@@ -74,7 +116,10 @@ impl<'a> PhysicalMemory<'a> {
                 "minidump virtual memory streams require a separate acquisition reader")),
         };
         let allow_transition = std::env::var_os("DUMPY_STRICT_PTE").is_none();
-        Ok(Self { file, segments, allow_transition, transition_translations: 0 })
+        let top_of_memory = segments.iter().map(|s| s.physical + s.length).max().unwrap_or(0);
+        Ok(Self { file, segments, allow_transition, transition_translations: 0,
+                  kernel_root: None, prototype_translations: 0, top_of_memory, following_prototype: false,
+                  vad: None, vad_translations: 0, last_absent_zero: false })
     }
 
     pub fn segments(&self) -> &[crashdump::Segment] { &self.segments }
@@ -100,7 +145,7 @@ impl<'a> PhysicalMemory<'a> {
         Ok(())
     }
 
-    fn entry(&mut self, table: u64, index: u64) -> io::Result<(u64, EntryKind)> {
+    fn entry(&mut self, table: u64, index: u64, level: u8) -> io::Result<(u64, EntryKind)> {
         let position = (table & 0x000f_ffff_ffff_f000)
             .checked_add(index * 8)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "page-table overflow"))?;
@@ -108,9 +153,106 @@ impl<'a> PhysicalMemory<'a> {
         self.read_exact_at(position, &mut bytes)?;
         let entry = u64::from_le_bytes(bytes);
         match classify_entry(entry, self.allow_transition) {
+            Some(EntryKind::Transition) => Ok((self.unswizzle(entry), EntryKind::Transition)),
             Some(kind) => Ok((entry, kind)),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "page not present")),
+            None if level == 1 && entry & (1 << 10) != 0 => self.follow_prototype(entry),
+            None => {
+                self.last_absent_zero = entry == 0;
+                Err(io::Error::new(io::ErrorKind::NotFound, describe_absent(entry, level)))
+            }
         }
+    }
+
+    /// Software PTEs on systems with "PTE swizzling" store the PFN with its
+    /// upper bits inverted when SwizzleBit (bit 4) is clear. A transition PFN
+    /// that lands beyond the capture with that bit clear is unswizzled by
+    /// dropping the bits above the capture's highest address.
+    fn unswizzle(&self, entry: u64) -> u64 {
+        const PFN_MASK: u64 = 0x000f_ffff_ffff_f000;
+        if entry & (1 << 4) != 0 || self.top_of_memory == 0 { return entry; }
+        let pfn_addr = entry & PFN_MASK;
+        if pfn_addr < self.top_of_memory { return entry; }
+        let keep = (1u64 << (64 - self.top_of_memory.leading_zeros())) - 1;
+        (entry & !PFN_MASK) | (pfn_addr & keep & PFN_MASK)
+    }
+
+    /// Valid=0, Prototype=1, not a transition: `_MMPTE_PROTOTYPE`. Bits 16..63
+    /// hold the sign-extended kernel address of the prototype PTE. Read that
+    /// PTE through the kernel root; a hardware-valid or transition prototype
+    /// names the shared physical page. Pagefile, subsection (never read from
+    /// file) and demand-zero prototypes stay unresolvable. The special
+    /// VAD-prototype encoding (ProtoAddress == 0xFFFFFFFF0000) is not followed.
+    fn follow_prototype(&mut self, entry: u64) -> io::Result<(u64, EntryKind)> {
+        const PROTOTYPE: u64 = 1 << 10;
+        let not_present = |why: &str| io::Error::new(io::ErrorKind::NotFound, format!("page not present (PT {why})"));
+        if !self.allow_transition || self.following_prototype || entry & PROTOTYPE == 0 || entry & 1 != 0 {
+            return Err(not_present("prototype pointer, not followed"));
+        }
+        if self.kernel_root.is_none() { return Err(not_present("prototype pointer, no kernel root")); }
+        let proto_va = ((entry as i64) >> 16) as u64;
+        if proto_va == 0xffff_ffff_0000 { return Err(not_present("VAD prototype")); }
+        if proto_va >> 47 != 0x1ffff || proto_va & 7 != 0 {
+            return Err(not_present("prototype pointer, bad address"));
+        }
+        self.resolve_proto_pte(proto_va).map(|proto| (proto, EntryKind::Prototype))
+    }
+
+    /// Read a prototype PTE at a kernel VA and return it as a leaf entry when
+    /// it names a physical page.
+    fn resolve_proto_pte(&mut self, proto_va: u64) -> io::Result<u64> {
+        const PROTOTYPE: u64 = 1 << 10;
+        let Some(root) = self.kernel_root else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "page not present (no kernel root)"));
+        };
+        self.following_prototype = true;
+        let result = (|| {
+            let phys = self.translate(root, proto_va, 4).map_err(|_|
+                io::Error::new(io::ErrorKind::NotFound, "page not present (PT prototype PTE itself unmapped)"))?;
+            let mut bytes = [0u8; 8];
+            self.read_exact_at(phys, &mut bytes)?;
+            let proto = u64::from_le_bytes(bytes);
+            match classify_entry(proto, true) {
+                Some(EntryKind::Present) => Ok(proto),
+                Some(EntryKind::Transition) => Ok(self.unswizzle(proto)),
+                _ => Err(io::Error::new(io::ErrorKind::NotFound,
+                    if proto & PROTOTYPE != 0 { "page not present (PT prototype: file-backed, not in RAM)" }
+                    else if proto == 0 { "page not present (PT prototype: demand zero)" }
+                    else { "page not present (PT prototype: paged out)" })),
+            }
+        })();
+        self.following_prototype = false;
+        result
+    }
+
+    /// No PTE: find the VAD covering `va` and read its prototype PTE.
+    fn resolve_vad(&mut self, dtb: u64, va: u64) -> io::Result<u64> {
+        let miss = |why: &str| io::Error::new(io::ErrorKind::NotFound, format!("page not present (VAD: {why})"));
+        let (root, off) = match &self.vad {
+            Some(state) => match state.roots.get(&(dtb & 0x000f_ffff_ffff_f000)) {
+                Some(r) => (*r, state.first_proto_offset),
+                None => return Err(miss("no VAD root for this address space")),
+            },
+            None => return Err(miss("not loaded")),
+        };
+        self.following_prototype = true;
+        let found = crate::vad::lookup(self, root, va >> 12);
+        let first = found.and_then(|(node, _, _)| {
+            let mut b = [0u8; 16];
+            let k = self.kernel_root?;
+            self.read_virtual(k, node + off, &mut b, 4).ok()?;
+            Some((u64::from_le_bytes(b[..8].try_into().unwrap()), u64::from_le_bytes(b[8..].try_into().unwrap())))
+        });
+        self.following_prototype = false;
+        let Some((_, start, _)) = found else { return Err(miss("no VAD covers address")) };
+        let Some((first, last)) = first else { return Err(miss("node unreadable")) };
+        if first == 0 { return Err(miss("private memory, never touched")); }
+        if !crate::vad::is_kernel_pointer(first) { return Err(miss("bad FirstPrototypePte")); }
+        let proto_va = first + 8 * ((va >> 12) - start);
+        // LastContiguousPte bounds data-file views made of several subsections.
+        if crate::vad::is_kernel_pointer(last) && last >= first && proto_va > last {
+            return Err(miss("beyond contiguous prototype PTEs"));
+        }
+        self.resolve_proto_pte(proto_va)
     }
 
     /// Translate a canonical x64 virtual address using a caller-provided DTB/CR3.
@@ -133,16 +275,41 @@ impl<'a> PhysicalMemory<'a> {
         if top != expected {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "noncanonical virtual address"));
         }
+        match self.walk(dtb, va, levels) {
+            Err(e) if self.last_absent_zero && va >> 47 == 0 && self.vad.is_some() && !self.following_prototype => {
+                match self.resolve_vad(dtb, va) {
+                    Ok(leaf) => {
+                        self.vad_translations += 1;
+                        Ok(((leaf & 0x000f_ffff_ffff_f000) | (va & 0xfff), EntryKind::Vad))
+                    }
+                    // Keep the more specific VAD reason unless no VAD covers it.
+                    Err(v) if v.to_string().contains("no VAD covers") => Err(e),
+                    Err(v) => Err(v),
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn walk(&mut self, dtb: u64, va: u64, levels: u8) -> io::Result<(u64, EntryKind)> {
+        self.last_absent_zero = false;
         let mut table = dtb & 0x000f_ffff_ffff_f000;
         let mut kind = EntryKind::Present;
         let finish = |this: &mut Self, physical: u64, kind: EntryKind| {
-            if kind == EntryKind::Transition { this.transition_translations += 1; }
+            match kind {
+                EntryKind::Transition => this.transition_translations += 1,
+                EntryKind::Prototype => this.prototype_translations += 1,
+                EntryKind::Present | EntryKind::Vad => {}
+            }
             Ok((physical, kind))
         };
         for level in (1..=levels).rev() {
             let shift = 12 + 9 * (level as u64 - 1);
-            let (entry, entry_kind) = self.entry(table, (va >> shift) & 0x1ff)?;
-            if entry_kind == EntryKind::Transition { kind = EntryKind::Transition; }
+            let (entry, entry_kind) = self.entry(table, (va >> shift) & 0x1ff, level)?;
+            if entry_kind == EntryKind::Prototype && level != 1 {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "page not present"));
+            }
+            if entry_kind != EntryKind::Present { kind = entry_kind; }
             let phys_base = entry & 0x000f_ffff_ffff_f000;
             if level == 3 && entry & (1 << 7) != 0 {
                 // 1 GiB page, including physical address bits [51:30].

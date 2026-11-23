@@ -34,6 +34,16 @@ pub struct RecoveryRecord {
     pub missing_export_pages: usize,
     pub fallback_pages: usize,
     pub fallback_sources: Vec<(u64, u64)>,
+    /// Fallback pages that lie in headers or non-writable sections: image
+    /// pages the loader shares copy-on-write between processes, so another
+    /// process's copy is the same bytes unless somebody patched them.
+    pub fallback_shared_pages: usize,
+    /// Fallback pages in writable sections (.data, .bss): per-process state,
+    /// so a page borrowed from another process is not this process's data.
+    pub fallback_private_pages: usize,
+    /// Shared-section fallback pages that read differently from a third
+    /// root: a per-process patch (hook) or a relocation difference.
+    pub fallback_conflicts: usize,
     pub file_backed_pages: usize,
     pub missing_file_backed_pages: usize,
     pub executable_pages: usize,
@@ -42,6 +52,13 @@ pub struct RecoveryRecord {
     /// (standby/modified list). Their bytes are the page's last contents,
     /// but the page was not hardware-valid at acquisition time.
     pub transition_pages: usize,
+    /// Pages reached through a prototype PTE: shared file-backed pages this
+    /// process never touched, resolved via the section's prototype PTEs.
+    pub prototype_pages: usize,
+    /// Pages with no PTE, resolved through the VAD tree.
+    pub vad_pages: usize,
+    /// exact | code-complete | merged | partial | unavailable
+    pub completeness: &'static str,
     pub sections: Vec<SectionCoverage>,
     pub audit: Option<PeAudit>,
     pub priority: &'static str,
@@ -147,9 +164,10 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
         image_size: size, available_pages: 0, missing_pages: Vec::new(),
         output: None, diagnostics: String::new(), missing_header_pages: 0,
         missing_import_pages: 0, missing_export_pages: 0, fallback_pages: 0,
-        fallback_sources: Vec::new(), file_backed_pages: 0,
+        fallback_sources: Vec::new(), fallback_shared_pages: 0, fallback_private_pages: 0,
+        fallback_conflicts: 0, file_backed_pages: 0,
         missing_file_backed_pages: 0, executable_pages: 0,
-        missing_executable_pages: 0, transition_pages: 0, sections: Vec::new(), audit: None,
+        missing_executable_pages: 0, transition_pages: 0, prototype_pages: 0, vad_pages: 0, completeness: "unavailable", sections: Vec::new(), audit: None,
         priority: "unavailable", layout: "unknown", layout_evidence: LayoutEvidence::default(),
         executable_utf16_ratio: 0.0, incoherent_warning: false };
     if size == 0 || size > MAX_IMAGE {
@@ -166,10 +184,14 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
         let mut original_error = None;
         for (root_index, dtb) in dtbs.iter().enumerate() {
             let before = memory.transition_translations;
+            let before_proto = memory.prototype_translations;
+            let before_vad = memory.vad_translations;
             match memory.read_virtual(*dtb, va, page, 4) {
                 Ok(()) => {
                     record.available_pages += 1;
                     if memory.transition_translations != before { record.transition_pages += 1; }
+                    if memory.prototype_translations != before_proto { record.prototype_pages += 1; }
+                    if memory.vad_translations != before_vad { record.vad_pages += 1; }
                     if root_index > 0 {
                         record.fallback_pages += 1;
                         record.fallback_sources.push((va, *dtb));
@@ -189,6 +211,32 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
         Ok(pe) => pe,
         Err(e) => { record.diagnostics = format!("PE header unavailable or invalid: {e}"); return Ok(record); }
     };
+    // Classify every borrowed page by the section it lands in. Pages were
+    // read at virtual addresses, so section virtual ranges apply whatever
+    // layout the rebuild chooses below.
+    for (va, from_dtb) in record.fallback_sources.clone() {
+        let rva = va.wrapping_sub(module.image_base);
+        let in_headers = rva < pe.headers_size as u64;
+        let writable = pe.sections.iter().any(|s| s.characteristics & 0x8000_0000 != 0 &&
+            intersects(rva, s.virtual_address as u64, s.virtual_size.max(s.raw_size) as u64));
+        if !in_headers && writable {
+            record.fallback_private_pages += 1;
+            continue;
+        }
+        record.fallback_shared_pages += 1;
+        // Second opinion: does another root that maps this page agree?
+        let offset = rva as usize;
+        let Some(ours) = mapped.get(offset..offset + 4096) else { continue };
+        let mut other = [0u8; 4096];
+        let mut checked = 0;
+        for dtb in dtbs.iter().filter(|d| **d != from_dtb) {
+            if checked >= 2 { break; }
+            if memory.read_virtual(*dtb, va, &mut other, 4).is_ok() {
+                checked += 1;
+                if other[..] != *ours { record.fallback_conflicts += 1; break; }
+            }
+        }
+    }
     let (rebuilt, layout, evidence) = match choose_layout_detailed(&pe, &mapped) {
         Ok(result) => result,
         Err(e) => { record.diagnostics = format!("section reconstruction failed: {e}"); return Ok(record); }
@@ -273,7 +321,7 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
     record.executable_utf16_ratio = profile.ratio();
     record.incoherent_warning = profile.strongly_text_like() &&
         audit.imports.status == "invalid" && audit.exports.status == "invalid" &&
-        record.missing_file_backed_pages == 0 && record.fallback_pages == 0;
+        record.missing_file_backed_pages == 0 && record.fallback_private_pages == 0;
     let tables_ok = matches!(audit.imports.status, "valid" | "absent") &&
         matches!(audit.exports.status, "valid" | "absent");
     record.priority = if record.incoherent_warning {
@@ -289,17 +337,40 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
     } else { "partial-review" };
     record.audit = Some(audit);
     let complete = record.missing_pages.is_empty();
+    // Borrowing only shared image pages that no other mapping disputes
+    // yields the same bytes a single process would have given: a real
+    // recovery. Borrowed writable pages or disputed pages do not.
+    let coherent_merge = record.fallback_private_pages == 0 && record.fallback_conflicts == 0;
+    // Code-complete: headers, every executable page and the import/export
+    // directories came from memory and validate; only non-executable data
+    // (typically .rsrc/.reloc/.data the process never touched) is
+    // zero-filled. Loadable and analysable, but not byte-identical to disk.
+    let code_complete = !complete && coherent_merge && !record.incoherent_warning &&
+        record.missing_header_pages == 0 && record.executable_pages > 0 &&
+        record.missing_executable_pages == 0 && record.missing_import_pages == 0 &&
+        record.missing_export_pages == 0 && tables_ok;
+    record.completeness = if record.fallback_pages > 0 && !coherent_merge { "merged" }
+        else if complete { "exact" } else if code_complete { "code-complete" } else { "partial" };
     let filename = format!("{}_0x{:016x}.{}", safe_name(&name), module.image_base,
-        if record.fallback_pages > 0 { "merged.bin" }
-        else if complete { "recovered.pe" } else { "partial.bin" });
+        match record.completeness { "merged" => "merged.bin", "exact" => "recovered.pe",
+            "code-complete" => "code-complete.pe", _ => "partial.bin" });
+    let zero_filled = record.sections.iter().filter(|s| s.missing_pages > 0)
+        .map(|s| format!("{} {}/{}", s.name, s.missing_pages, s.pages)).collect::<Vec<_>>();
     let destination = dir.join(filename);
     fs::create_dir_all(dir)?;
     fs::write(&destination, &rebuilt)?;
     record.output = Some(destination.to_string_lossy().into_owned());
-    record.diagnostics = format!("{}; layout={}; priority={}; fallback_pages={}; transition_pages={}; missing_header={} missing_import={} missing_export={}; file_backed={}/{} executable={}/{}; {}",
-        if record.fallback_pages > 0 { "merged process mappings (not guaranteed coherent)" }
-        else if complete { "complete pages" } else { "partial pages" }, record.layout, record.priority,
-        record.fallback_pages, record.transition_pages,
+    record.diagnostics = format!("{}; layout={}; priority={}; fallback_pages={} (shared={} private={} conflicts={}); transition_pages={} prototype_pages={} vad_pages={}; missing_header={} missing_import={} missing_export={}; file_backed={}/{} executable={}/{}; {}",
+        match (record.completeness, record.fallback_pages > 0) {
+            ("merged", _) => "merged process mappings (not guaranteed coherent)".to_string(),
+            ("exact", true) => "complete pages (shared image pages borrowed from other processes)".to_string(),
+            ("exact", false) => "complete pages".to_string(),
+            ("code-complete", _) => format!("code-complete: headers, code and import/export tables from memory; zero-filled: {}", zero_filled.join(" ")),
+            (_, true) => "partial pages (shared image pages borrowed from other processes)".to_string(),
+            _ => "partial pages".to_string(),
+        }, record.layout, record.priority,
+        record.fallback_pages, record.fallback_shared_pages, record.fallback_private_pages, record.fallback_conflicts,
+        record.transition_pages, record.prototype_pages, record.vad_pages,
         record.missing_header_pages, record.missing_import_pages, record.missing_export_pages,
         record.file_backed_pages - record.missing_file_backed_pages, record.file_backed_pages,
         record.executable_pages - record.missing_executable_pages, record.executable_pages,
@@ -308,11 +379,11 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
 }
 
 pub fn write_report(dir: &Path, records: &[RecoveryRecord]) -> io::Result<()> {
-    let mut report = String::from("name\tbase\timage_bytes\tavailable_pages\tmissing_pages\tfallback_pages\tmissing_header\tmissing_import\tmissing_export\tfile_backed_pages\tmissing_file_backed_pages\texecutable_pages\tmissing_executable_pages\toutput\tdiagnostics\tpriority\timport_status\texport_status\tlayout\traw_import_status\traw_import_descriptors\traw_import_symbols\tmapped_import_status\tmapped_import_descriptors\tmapped_import_symbols\traw_export_status\tmapped_export_status\texecutable_utf16_ascii_ratio\tincoherent_warning\ttransition_pages\n");
+    let mut report = String::from("name\tbase\timage_bytes\tavailable_pages\tmissing_pages\tfallback_pages\tmissing_header\tmissing_import\tmissing_export\tfile_backed_pages\tmissing_file_backed_pages\texecutable_pages\tmissing_executable_pages\toutput\tdiagnostics\tpriority\timport_status\texport_status\tlayout\traw_import_status\traw_import_descriptors\traw_import_symbols\tmapped_import_status\tmapped_import_descriptors\tmapped_import_symbols\traw_export_status\tmapped_export_status\texecutable_utf16_ascii_ratio\tincoherent_warning\ttransition_pages\tfallback_shared_pages\tfallback_private_pages\tfallback_conflicts\tprototype_pages\tvad_pages\tcompleteness\n");
     for item in records {
         let imports = item.audit.as_ref().map(|a| a.imports.status).unwrap_or("unavailable");
         let exports = item.audit.as_ref().map(|a| a.exports.status).unwrap_or("unavailable");
-        report.push_str(&format!("{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\n",
+        report.push_str(&format!("{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_field(&item.name), item.base, item.image_size, item.available_pages,
             item.missing_pages.len(), item.fallback_pages, item.missing_header_pages, item.missing_import_pages,
             item.missing_export_pages, item.file_backed_pages, item.missing_file_backed_pages,
@@ -323,7 +394,9 @@ pub fn write_report(dir: &Path, records: &[RecoveryRecord]) -> io::Result<()> {
             item.layout_evidence.raw_import_symbols, item.layout_evidence.mapped_import,
             item.layout_evidence.mapped_import_entries, item.layout_evidence.mapped_import_symbols,
             item.layout_evidence.raw_export, item.layout_evidence.mapped_export,
-            item.executable_utf16_ratio, item.incoherent_warning, item.transition_pages));
+            item.executable_utf16_ratio, item.incoherent_warning, item.transition_pages,
+            item.fallback_shared_pages, item.fallback_private_pages, item.fallback_conflicts,
+            item.prototype_pages, item.vad_pages, item.completeness));
     }
     fs::create_dir_all(dir)?;
     fs::write(dir.join("dumpy_recovery.tsv"), report)?;
