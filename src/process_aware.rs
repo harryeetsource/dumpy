@@ -52,7 +52,8 @@ struct RootScan {
 }
 
 /// An identity recovered by an earlier batch into the same output directory.
-struct Persisted { name: String, output: String, listed: bool }
+/// `batch`: the root range that recovered this identity (empty if none yet).
+struct Persisted { name: String, output: String, listed: bool, batch: String }
 
 const IDENTITIES_FILE: &str = "dumpy_identities.tsv";
 
@@ -65,7 +66,7 @@ fn load_persisted(images_dir: &Path) -> HashMap<Key, Persisted> {
         let hex = |v: &str| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok();
         let (Some(base), Some(size), Some(fp)) = (hex(f[0]), f[1].parse::<u32>().ok(), hex(f[2])) else { continue };
         map.insert((base, size, fp), Persisted { name: f[3].to_owned(), output: f[4].to_owned(),
-            listed: f[5] == "true" });
+            listed: f[5] == "true", batch: f.get(6).copied().unwrap_or("").to_owned() });
     }
     map
 }
@@ -145,9 +146,16 @@ fn recover_identity(mem: &mut PhysicalMemory<'_>, key: Key, identity: &Identity,
     if identity.names.is_empty() {
         if let Some(path) = record.output.clone() {
             if let Ok(bytes) = fs::read(&path) {
+                // Export name, then VERSIONINFO, then the .NET Module name
+                // (the assembly's own file name), then the CodeView PDB name.
                 let found = Pe::parse(&bytes).ok().and_then(|pe|
                     pe.export_name(&bytes).map(|n| (n, "export name"))
-                        .or_else(|| pe.version_name(&bytes).map(|n| (n, "version resource"))));
+                        .or_else(|| pe.version_name(&bytes).map(|n| (n, "version resource")))
+                        .or_else(|| pe.clr_module_name(&bytes).map(|n| {
+                            let kind = if n.starts_with('ℛ') { ".NET module, Roslyn script submission" } else { ".NET module" };
+                            (n, kind)
+                        }))
+                        .or_else(|| pe.pdb_info(&bytes).map(|(p, _)| (Pe::pdb_leaf(&p).to_string(), "pdb name"))));
                 if let Some((name, source)) = found {
                     let safe: String = name.chars().map(|c|
                         if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
@@ -227,6 +235,15 @@ fn build_page_index(sources: &[(String, PathBuf)]) -> HashMap<u64, (String, u32)
     index
 }
 
+fn report_vad(r: &crate::vad::Report) {
+    match (r.root_offset, r.first_proto_offset) {
+        (Some(root), Some(fp)) => println!(
+            "[vad] EPROCESS.VadRoot=+{root:#x} (trees covering PEB {}/{}, {} nodes) MMVAD.FirstPrototypePte=+{fp:#x} ({}/{} PFN matches); installed for {} of {} address spaces",
+            r.root_support.0, r.root_support.1, r.nodes, r.proto_matches.0, r.proto_matches.1, r.installed, r.candidates),
+        _ => println!("[vad] VAD resolution off: {}", r.note),
+    }
+}
+
 pub fn run(input: &Path, output: &Path, roots: Vec<u64>, kernel_root: Option<u64>,
            pid_by_dtb: &HashMap<u64, (String, String)>, limits: &Limits) -> io::Result<()> {
     let mut file = fs::File::open(input)?;
@@ -235,13 +252,14 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, kernel_root: Option<u64
     println!("[process-aware] kernel root {} (prototype PTEs {})",
         kernel_root.map(|k| format!("0x{k:x}")).unwrap_or_else(|| "unknown".into()),
         if kernel_root.is_some() && physical.allow_transition { "followed" } else { "not followed" });
+    fs::create_dir_all(output)?;
+    let eprocess_path = output.join("dumpy_eprocess.tsv");
+    let mut vad_pending = false;
     if physical.allow_transition {
-        let r = crate::vad::setup(&mut physical, output);
-        match (r.root_offset, r.first_proto_offset) {
-            (Some(root), Some(fp)) => println!(
-                "[vad] EPROCESS.VadRoot=+{root:#x} (trees covering PEB {}/{}, {} nodes) MMVAD.FirstPrototypePte=+{fp:#x} ({}/{} PFN matches); installed for {} of {} address spaces",
-                r.root_support.0, r.root_support.1, r.nodes, r.proto_matches.0, r.proto_matches.1, r.installed, r.candidates),
-            _ => println!("[vad] VAD resolution off: {}", r.note),
+        if eprocess_path.exists() { report_vad(&crate::vad::setup(&mut physical, output)); }
+        else {
+            vad_pending = true;
+            println!("[vad] {} not found; it will be built from this batch's processes after the scan phase", eprocess_path.display());
         }
     }
     fs::create_dir_all(output)?;
@@ -252,8 +270,25 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, kernel_root: Option<u64
         if limits.scan_only { "discovery-only" } else { "bounded-recovery" });
 
     let batch = format!("r{}-{}", limits.root_start, end_root);
+    // Re-running a finished batch into the same folder would treat its own
+    // images as already recovered and overwrite its tables with what is
+    // left: refuse unless asked.
+    let done_marker = output.join(format!(".dumpy_batch_{batch}.done"));
+    if done_marker.exists() && std::env::var_os("DUMPY_RERUN").is_none() {
+        println!("[process-aware] batch {batch} already completed in {}; skipping. Use a new output folder, or set DUMPY_RERUN=1 to redo it (its tables are then rebuilt from scratch).",
+            output.display());
+        return Ok(());
+    }
+    if done_marker.exists() { println!("[process-aware] DUMPY_RERUN set: redoing batch {batch}"); }
     let shared_dir = output.join("images");
-    let persisted = load_persisted(&shared_dir);
+    let mut persisted = load_persisted(&shared_dir);
+    if done_marker.exists() {
+        // Forced rerun: identities this batch recovered last time are
+        // recovered again instead of being treated as done elsewhere.
+        let before = persisted.len();
+        persisted.retain(|_, p| p.batch != batch);
+        println!("[process-aware] {} identities from the previous run of {batch} will be recovered again", before - persisted.len());
+    }
     if !persisted.is_empty() {
         println!("[process-aware] {} identities carried over from earlier batches", persisted.len());
     }
@@ -334,6 +369,32 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, kernel_root: Option<u64
     reasons.sort();
     println!("[process-aware] pass2: retried={retried} rescued={rescued}; reject reasons overall: {}", reasons.join(" "));
     let found = scans.iter().map(|r| r.scan.processes.len()).sum::<usize>();
+
+    // ── EPROCESS bootstrap for VAD resolution ──────────────────────────
+    // First batch into a fresh directory: learn the EPROCESS layout from the
+    // PEBs just validated, write dumpy_eprocess.tsv for this and later
+    // batches, then switch VAD resolution on before recovery.
+    if vad_pending {
+        let mut anchors = HashMap::<u64, Vec<u64>>::new();
+        for root in &scans {
+            for process in &root.scan.processes {
+                let entry = anchors.entry(root.dtb).or_default();
+                if process.bitness == 64 { entry.insert(0, process.peb); } else { entry.push(process.peb); }
+            }
+        }
+        let mut live: HashSet<u64> = roots.iter().copied().collect();
+        live.extend(anchors.keys().copied());
+        println!("[vad] building {} from {} anchored address spaces", eprocess_path.display(), anchors.len());
+        let _ = io::stdout().flush();
+        match crate::eprocess::scan(&mut physical, &live, &anchors, kernel_root) {
+            Ok(report) => {
+                // Another batch may have written it meanwhile; keep theirs.
+                if !eprocess_path.exists() { crate::eprocess::write_tsv(&report, output)?; }
+                report_vad(&crate::vad::setup(&mut physical, output));
+            }
+            Err(e) => println!("[vad] VAD resolution off: EPROCESS scan failed ({e})"),
+        }
+    }
 
     // ── Identity map ───────────────────────────────────────────────────
     let mut identities = HashMap::<Key, Identity>::new();
@@ -491,7 +552,7 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, kernel_root: Option<u64
     fs::write(output.join(format!("dumpy_skipped_modules.{batch}.tsv")), &skipped)?;
     // Persist identities for later batches sharing this output directory.
     {
-        let mut text = String::from("base\tsize_of_image\tfingerprint\tname\toutput\tlisted\n");
+        let mut text = String::from("base\tsize_of_image\tfingerprint\tname\toutput\tlisted\tbatch\n");
         let mut keys = identities.keys().copied().chain(persisted.keys().copied()).collect::<Vec<_>>();
         keys.sort_unstable(); keys.dedup();
         for key in keys {
@@ -505,7 +566,9 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, kernel_root: Option<u64
                 .or_else(|| prior.map(|p| p.output.clone())).unwrap_or_default();
             let listed = identity.is_some_and(|i| !i.listed_in.is_empty() || i.persisted_listed)
                 || prior.is_some_and(|p| p.listed);
-            text.push_str(&format!("0x{:x}\t{}\t0x{:016x}\t{}\t{}\t{}\n", key.0, key.1, key.2, clean(&name), out, listed));
+            let owner = if done.contains_key(&key) { batch.clone() }
+                else { prior.map(|p| p.batch.clone()).unwrap_or_default() };
+            text.push_str(&format!("0x{:x}\t{}\t0x{:016x}\t{}\t{}\t{}\t{}\n", key.0, key.1, key.2, clean(&name), out, listed, owner));
         }
         fs::create_dir_all(&shared_dir)?;
         fs::write(shared_dir.join(IDENTITIES_FILE), text)?;
@@ -758,6 +821,7 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, kernel_root: Option<u64
     for stem in ["dumpy_processes", "dumpy_modules", "dumpy_unlisted_images", "dumpy_orphan_executable", "dumpy_skipped_modules"] {
         merge_batches(output, stem)?;
     }
+    fs::write(&done_marker, format!("{}\n", crate::VERSION))?;
 
     println!("[process-aware] validated PEB processes={} identities={} recovered={} skipped={} report={}",
         found, identities.len(), records.iter().filter(|r| r.output.is_some()).count(),

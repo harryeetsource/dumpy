@@ -296,6 +296,100 @@ impl Pe {
     /// The module name recorded in the export directory, if the directory
     /// and the name string are both inside recovered file-layout bytes.
     /// Used only as a naming fallback; it is never trusted for identity.
+    /// Data directory `index` read straight from the optional header.
+    pub fn data_directory(&self, b: &[u8], index: usize) -> Option<(u32, u32)> {
+        let nt = u32_at(b, 0x3c)? as usize;
+        let opt = nt.checked_add(24)?;
+        let count = u32_at(b, opt + if self.is_64 { 108 } else { 92 })? as usize;
+        if index >= count.min(16) { return None; }
+        let at = opt + if self.is_64 { 112 } else { 96 } + index * 8;
+        let (rva, size) = (u32_at(b, at)?, u32_at(b, at + 4)?);
+        (rva != 0 && size != 0).then_some((rva, size))
+    }
+
+    /// CodeView record from the debug directory: (PDB path, symbol-server
+    /// key = GUID without dashes + age in hex). RSDS (PDB 7) and NB10 (PDB 2).
+    pub fn pdb_info(&self, b: &[u8]) -> Option<(String, String)> {
+        let (rva, size) = self.data_directory(b, 6)?;
+        let dir = self.rva_to_raw_range(rva, 28)?;
+        for i in 0..(size as usize / 28).min(32) {
+            let e = dir.checked_add(i * 28)?;
+            if u32_at(b, e + 12)? != 2 { continue; } // IMAGE_DEBUG_TYPE_CODEVIEW
+            let len = u32_at(b, e + 16)? as usize;
+            let data_rva = u32_at(b, e + 20)?;
+            if len < 24 || len > 4096 || data_rva == 0 { continue; }
+            let Some(at) = self.rva_to_raw_range(data_rva, len) else { continue };
+            let rec = b.get(at..at + len)?;
+            let (key, path_at) = match &rec[..4] {
+                b"RSDS" => {
+                    let g = &rec[4..20];
+                    let d1 = u32::from_le_bytes(g[0..4].try_into().ok()?);
+                    let d2 = u16::from_le_bytes(g[4..6].try_into().ok()?);
+                    let d3 = u16::from_le_bytes(g[6..8].try_into().ok()?);
+                    let tail: String = g[8..16].iter().map(|x| format!("{x:02X}")).collect();
+                    let age = u32::from_le_bytes(rec[20..24].try_into().ok()?);
+                    (format!("{d1:08X}{d2:04X}{d3:04X}{tail}{age:X}"), 24)
+                }
+                b"NB10" if len >= 16 => {
+                    let sig = u32::from_le_bytes(rec[8..12].try_into().ok()?);
+                    let age = u32::from_le_bytes(rec[12..16].try_into().ok()?);
+                    (format!("{sig:08X}{age:X}"), 16)
+                }
+                _ => continue,
+            };
+            let path = &rec[path_at..];
+            let end = path.iter().position(|v| *v == 0).unwrap_or(path.len());
+            let path = std::str::from_utf8(&path[..end]).ok()?;
+            if path.is_empty() || !path.chars().all(|c| !c.is_control()) { continue; }
+            return Some((path.to_string(), key));
+        }
+        None
+    }
+
+    /// File name of a PDB path, for naming: `D:\x\foo.pdb` -> `foo.pdb`.
+    pub fn pdb_leaf(path: &str) -> &str {
+        path.rsplit(['\\', '/']).next().unwrap_or(path)
+    }
+
+    /// .NET: the Module table's name (the assembly's file name, e.g.
+    /// `System.Foo.dll`) from the CLI metadata. Module is table 0, so its
+    /// first row follows the #~ header and row counts directly.
+    pub fn clr_module_name(&self, b: &[u8]) -> Option<String> {
+        let (rva, _) = self.data_directory(b, 14)?;
+        let cor = self.rva_to_raw_range(rva, 72)?;
+        let (md_rva, md_size) = (u32_at(b, cor + 8)?, u32_at(b, cor + 12)? as usize);
+        let root = self.rva_to_raw_range(md_rva, md_size.min(1 << 20))?;
+        if u32_at(b, root)? != 0x424A_5342 { return None; } // "BSJB"
+        let vlen = u32_at(b, root + 12)? as usize;
+        if vlen > 256 { return None; }
+        let mut at = root + 16 + vlen;
+        let streams = u16_at(b, at + 2)? as usize;
+        at += 4;
+        let (mut tables, mut strings) = (None, None);
+        for _ in 0..streams.min(16) {
+            let (off, size) = (u32_at(b, at)? as usize, u32_at(b, at + 4)? as usize);
+            let name_start = at + 8;
+            let name_len = b.get(name_start..name_start + 32)?.iter().position(|v| *v == 0)?;
+            let name = &b[name_start..name_start + name_len];
+            if name == b"#~" || name == b"#-" { tables = Some((root + off, size)); }
+            if name == b"#Strings" { strings = Some((root + off, size)); }
+            at = name_start + (name_len + 4) / 4 * 4;
+        }
+        let ((t, _), (st, st_size)) = (tables?, strings?);
+        let heap_sizes = *b.get(t + 6)?;
+        let valid = u64::from_le_bytes(b.get(t + 8..t + 16)?.try_into().ok()?);
+        if valid & 1 == 0 { return None; }
+        let first_row = t + 24 + 4 * valid.count_ones() as usize;
+        let idx = if heap_sizes & 1 != 0 { u32_at(b, first_row + 2)? as usize } else { u16_at(b, first_row + 2)? as usize };
+        if idx == 0 || idx >= st_size { return None; }
+        let bytes = b.get(st + idx..st + st_size.min(idx + 256))?;
+        let end = bytes.iter().position(|v| *v == 0)?;
+        let name = std::str::from_utf8(&bytes[..end]).ok()?;
+        // Any printable UTF-8: compilers emit non-ASCII module names, e.g.
+        // Roslyn scripting's "ℛ*<guid>#<n>-<m>.dll".
+        (!name.is_empty() && !name.chars().any(|c| c.is_control())).then(|| name.to_string())
+    }
+
     pub fn export_name(&self, b: &[u8]) -> Option<String> {
         if self.export.0 == 0 || self.export.1 < 40 { return None; }
         let dir = self.rva_to_raw_range(self.export.0, 40)?;
@@ -360,6 +454,59 @@ impl Pe {
 
 #[cfg(test)]
 mod tests {
+    fn put32(b: &mut [u8], o: usize, v: u32) { b[o..o + 4].copy_from_slice(&v.to_le_bytes()); }
+    fn put16(b: &mut [u8], o: usize, v: u16) { b[o..o + 2].copy_from_slice(&v.to_le_bytes()); }
+
+    /// PE32+ with one .rdata section holding a CodeView record and CLI metadata.
+    fn naming_pe() -> Vec<u8> {
+        let mut b = vec![0u8; 0x600];
+        b[..2].copy_from_slice(b"MZ"); put32(&mut b, 0x3c, 0x80); b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        put16(&mut b, 0x84, 0x8664); put16(&mut b, 0x86, 1); put16(&mut b, 0x94, 0xf0);
+        let opt = 0x98; put16(&mut b, opt, 0x20b);
+        put32(&mut b, opt + 32, 0x1000); put32(&mut b, opt + 36, 0x200);
+        put32(&mut b, opt + 56, 0x2000); put32(&mut b, opt + 60, 0x200); put32(&mut b, opt + 108, 16);
+        put32(&mut b, opt + 112 + 6 * 8, 0x1000); put32(&mut b, opt + 112 + 6 * 8 + 4, 28);
+        put32(&mut b, opt + 112 + 14 * 8, 0x1100); put32(&mut b, opt + 112 + 14 * 8 + 4, 72);
+        let s = 0x188; b[s..s + 6].copy_from_slice(b".rdata");
+        put32(&mut b, s + 8, 0x400); put32(&mut b, s + 12, 0x1000); put32(&mut b, s + 16, 0x400);
+        put32(&mut b, s + 20, 0x200); put32(&mut b, s + 36, 0x4000_0040);
+        // debug directory entry -> RSDS at RVA 0x1040
+        let path = b"C:\\b\\foo.pdb\0";
+        put32(&mut b, 0x200 + 12, 2); put32(&mut b, 0x200 + 16, (24 + path.len()) as u32); put32(&mut b, 0x200 + 20, 0x1040);
+        b[0x240..0x244].copy_from_slice(b"RSDS");
+        for i in 0..16 { b[0x244 + i] = i as u8 + 1; }
+        put32(&mut b, 0x254, 3); b[0x258..0x258 + path.len()].copy_from_slice(path);
+        // COR20 header at RVA 0x1100 -> metadata at RVA 0x1140
+        put32(&mut b, 0x300, 72); put32(&mut b, 0x308, 0x1140); put32(&mut b, 0x30c, 0x100);
+        let root = 0x340; put32(&mut b, root, 0x424A_5342); put32(&mut b, root + 12, 12);
+        b[root + 16..root + 26].copy_from_slice(b"v4.0.30319");
+        put16(&mut b, root + 30, 2);
+        put32(&mut b, root + 32, 0x40); put32(&mut b, root + 36, 0x40); b[root + 40..root + 42].copy_from_slice(b"#~");
+        put32(&mut b, root + 44, 0x80); put32(&mut b, root + 48, 0x20); b[root + 52..root + 60].copy_from_slice(b"#Strings");
+        let t = root + 0x40; b[t + 4] = 2; b[t + 7] = 1; put32(&mut b, t + 8, 1); put32(&mut b, t + 24, 1);
+        put16(&mut b, t + 28, 0); put16(&mut b, t + 30, 1);
+        b[root + 0x81..root + 0x88].copy_from_slice(b"Foo.dll");
+        b
+    }
+
+    #[test]
+    fn pdb_and_clr_names() {
+        let b = naming_pe();
+        let pe = Pe::parse(&b).unwrap();
+        let (path, key) = pe.pdb_info(&b).unwrap();
+        assert_eq!(path, "C:\\b\\foo.pdb");
+        assert_eq!(key, "040302010605080709 0A0B0C0D0E0F103".replace(' ', ""));
+        assert_eq!(Pe::pdb_leaf(&path), "foo.pdb");
+        assert_eq!(pe.clr_module_name(&b).as_deref(), Some("Foo.dll"));
+        // Roslyn script submission name (non-ASCII prefix).
+        let mut r = naming_pe();
+        let name = "ℛ*ab#3-0.dll".as_bytes();
+        r[0x340 + 0x81..0x340 + 0x81 + name.len()].copy_from_slice(name);
+        r[0x340 + 0x81 + name.len()] = 0;
+        let pe = Pe::parse(&r).unwrap();
+        assert_eq!(pe.clr_module_name(&r).as_deref(), Some("ℛ*ab#3-0.dll"));
+    }
+
     use super::*;
     #[test]
     fn rejects_negative_e_lfanew() {

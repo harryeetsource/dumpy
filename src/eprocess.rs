@@ -94,7 +94,13 @@ pub fn plausible_process(p: &Process) -> bool {
         !n.is_empty() && n.len() <= 15 && n.bytes().all(|b| (0x20..0x7f).contains(&b)) && !n.starts_with(' ')
     });
     if !name_ok || !small(p.pid) { return false; }
-    if matches!(p.pid, Some(0) | Some(4)) { return true; }
+    // Idle and System have no CreateTime/parent worth checking, so they are
+    // accepted by their exact names only.
+    match (p.pid, p.name.as_deref()) {
+        (Some(0), Some(n)) => return n == "Idle",
+        (Some(4), Some(n)) => return n == "System",
+        _ => {}
+    }
     small(p.ppid) && p.create_time.is_some_and(plausible_filetime)
 }
 
@@ -154,7 +160,11 @@ fn image_name(b: &[u8]) -> Option<String> {
     let lower = s.to_ascii_lowercase();
     // Names are truncated to 15 bytes, so a suffix test alone misses long
     // names; accept anything with an extension-looking dot or a known kernel name.
+    // ImageFileName keeps 14 characters, so a long name loses its extension
+    // ("msedgewebview2.exe" -> "msedgewebview2"): a full-length name is
+    // accepted without a dot.
     let ok = lower.ends_with(".exe") || lower.ends_with(".scr") || lower.contains('.') ||
+        (end >= 14 && text[0].is_ascii_alphanumeric()) ||
         matches!(s.as_str(), "System" | "Registry" | "MemCompression" | "Secure System");
     ok.then_some(s)
 }
@@ -283,11 +293,17 @@ pub fn scan(mem: &mut PhysicalMemory<'_>, live_dtbs: &HashSet<u64>, anchors: &Ha
         let objs: Vec<&Candidate> = if trusted.len() >= 2 { trusted } else { confirmed.iter().map(|(c, _, _)| c).collect() };
         // Byte-identical objects (a range imaged twice, or a kernel-side
         // copy) would defeat the distinctness tests; learn from one of each.
+        // Smeared copies differ in a few counters, so the body is not a
+        // reliable key; the same DTB and PEB is the same process.
         let mut seen_bodies = HashSet::new();
         let objs: Vec<&Candidate> = objs.into_iter().filter(|c| {
             let start = (c.physical - c.window_base) as usize;
             let body = &c.window[start..c.window.len().min(start + 0x400)];
-            seen_bodies.insert(body.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)))
+            let key = match at(c, *delta) {
+                Some(peb) if anchors.contains_key(&c.dtb) => (c.dtb, peb),
+                _ => (u64::MAX, body.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))),
+            };
+            seen_bodies.insert(key)
         }).collect();
         let mut layout = Layout { peb: Some(*delta), confirmed_objects: confirmed.len(), ..Default::default() };
         layout.distinct_objects = objs.len();
@@ -634,7 +650,7 @@ fn learn_layout(objs: &[&Candidate], layout: &mut Layout) {
     }
     // UniqueProcessId: small, 4-aligned, distinct across objects; followed by
     // ActiveProcessLinks (two kernel pointers).
-    let mut best_pid = (0usize, 0i64);
+    let mut best_pid = (0usize, 0usize, 0i64);
     for d in deltas() {
         let values: Vec<u64> = objs.iter().filter_map(|c| at(c, d)).collect();
         if values.len() < n { continue; }
@@ -642,17 +658,19 @@ fn learn_layout(objs: &[&Candidate], layout: &mut Layout) {
         let distinct = values.iter().collect::<HashSet<_>>().len();
         let links_ok = objs.iter().filter(|c| at(c, d + 8).is_some_and(kernel_pointer) &&
             at(c, d + 16).is_some_and(kernel_pointer)).count();
-        if plausible * 10 >= n * 9 && links_ok * 10 >= n * 9 && distinct > best_pid.0 {
-            best_pid = (distinct, d);
+        // Ties on distinctness go to the offset where more values are
+        // plausible PIDs (a list head or flags word scores lower there).
+        if plausible * 10 >= n * 9 && links_ok * 10 >= n * 9 && (distinct, plausible) > (best_pid.0, best_pid.1) {
+            best_pid = (distinct, plausible, d);
         }
     }
-    layout.scores.push(("pid-distinct", best_pid.0, best_pid.1));
+    layout.scores.push(("pid-distinct", best_pid.0, best_pid.2));
     // Captures can hold the same object more than once, so distinctness is a
     // floor (40%), not a near-identity test; the kernel-pointer pair after
     // the field is the stronger constraint.
     if best_pid.0 * 10 >= n * 4 {
-        layout.pid = Some(best_pid.1);
-        layout.links = Some(best_pid.1 + 8);
+        layout.pid = Some(best_pid.2);
+        layout.links = Some(best_pid.2 + 8);
     }
     // InheritedFromUniqueProcessId: values drawn from the PID set (parents may
     // have exited, so allow a minority of unknowns); not the PID offset itself.
@@ -681,6 +699,51 @@ fn describe(c: &Candidate, peb: u64, peb_confirmed: bool, live_root: bool, layou
         exit_time: layout.exit_time.and_then(|d| at(c, d)).filter(|v| plausible_filetime(*v)),
         in_active_list: None, source, duplicate_of: None, plausible: false, group_linked: None, exit_from_duplicate: false,
     }
+}
+
+/// Write `dumpy_eprocess.tsv` (and the look-alikes sidecar) for a report.
+pub fn write_tsv(report: &Report, out_dir: &std::path::Path) -> std::io::Result<()> {
+    use std::fs;
+    // Objects that only contain a DTB value but do not read as a process
+    // (PFN lists, pool copies) go to a sidecar so the main table is the
+    // process list. DUMPY_EPROCESS_ALL=1 keeps them in the main table.
+    let keep_all = std::env::var_os("DUMPY_EPROCESS_ALL").is_some();
+    let lookalikes = report.processes.iter().filter(|p| !p.plausible).count();
+    if lookalikes > 0 {
+        println!("[eprocess] {lookalikes} dtb-anchored objects do not read as processes (implausible pid/ppid/time/name); {}",
+            if keep_all { "kept in dumpy_eprocess.tsv" } else { "written to dumpy_eprocess_lookalikes.tsv" });
+    }
+    let ep_header = "source\tstate\tpid\tppid\tname\tdtb\tother_dtb\tlive_address_space\tcreate_time_utc\texit_time_utc\tin_active_list\tgroup_linked\teprocess_va\teprocess_phys\tpeb\tpeb_confirmed\tduplicate_of\tplausible\n";
+    let mut out = String::from(ep_header);
+    let mut side = String::from(ep_header);
+    for p in &report.processes {
+        let dst = if p.plausible || keep_all { &mut out } else { &mut side };
+        // Root found in RAM is not the same as process alive: a freed PML4
+        // page keeps its self-reference until reused.
+        let state = match (p.exit_time.is_some(), p.live_root, report.layout.exit_time.is_some()) {
+            (true, _, _) if p.exit_from_duplicate => "exited(this copy imaged before exit)",
+            (true, true, _) => "exited(page tables still in RAM)",
+            (true, false, _) => "exited",
+            (false, true, _) => "running",
+            (false, false, true) => "no-exit-time,root-missing",
+            (false, false, false) => "root-missing",
+        };
+        dst.push_str(&format!("{}\t{}\t{}\t{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0x{:x}\t0x{:x}\t{}\t{}\t{}\n",
+            p.source, state, p.pid.map(|v| v.to_string()).unwrap_or_default(), p.ppid.map(|v| v.to_string()).unwrap_or_default(),
+            p.name.clone().unwrap_or_default().replace('\t', " "), p.dtb,
+            p.other_dtb.map(|v| format!("0x{v:x}")).unwrap_or_default(), p.live_root,
+            p.create_time.map(filetime_iso).unwrap_or_default(),
+            p.exit_time.map(filetime_iso).unwrap_or_default(),
+            p.in_active_list.map(|v| v.to_string()).unwrap_or_default(),
+            p.group_linked.map(|v| v.to_string()).unwrap_or_default(),
+            p.eprocess_va.map(|v| format!("0x{v:x}")).unwrap_or_default(),
+            p.physical.saturating_sub(report.layout.field_offset), p.peb, p.peb_confirmed,
+            p.duplicate_of.map(|d| format!("0x{:x}", d.saturating_sub(report.layout.field_offset))).unwrap_or_default(),
+            p.plausible));
+    }
+    fs::write(out_dir.join("dumpy_eprocess.tsv"), &out)?;
+    if !keep_all && lookalikes > 0 { fs::write(out_dir.join("dumpy_eprocess_lookalikes.tsv"), &side)?; }
+    Ok(())
 }
 
 /// FILETIME → "YYYY-MM-DD HH:MM:SS" UTC.
@@ -715,7 +778,8 @@ mod tests {
     fn image_name_rules() {
         assert_eq!(image_name(b"svchost.exe\0\0\0\0\0"), Some("svchost.exe".into()));
         assert_eq!(image_name(b"System\0\0\0\0\0\0\0\0\0\0"), Some("System".into()));
-        assert_eq!(image_name(b"ChatGPT Classic\0"), None); // no dot, not kernel
+        assert_eq!(image_name(b"Some name\0\0\0\0\0\0\0"), None); // short, no dot, not kernel
+        assert_eq!(image_name(b"msedgewebview2\0\0"), Some("msedgewebview2".into())); // truncated
         assert_eq!(image_name(b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"), None);
     }
     #[test]

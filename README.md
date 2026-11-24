@@ -1,372 +1,378 @@
-# Dumpy — Windows memory forensics and PE recovery (work in progress)
+# dumpy
 
-## v0.11.0: bounded import/export verification and recovery prioritization
+Recover valid PE images (EXEs and DLLs) from Windows memory dumps, attribute them to the processes that had them mapped, and point out code that doesn't belong: injected, unlisted, or headerless.
 
-The new `pe_verify.rs` checks rebuilt file-layout images beyond the mere
-existence of import/export directory headers. Import checks validate descriptor
-terminators, DLL-name strings, thunk termination, imported names, ordinal
-encodings and RVA bounds. Export checks validate DLL names, address/name/
-ordinal arrays, referenced names, ordinal bounds and forwarder strings.
-Malformed or truncated structures are reported with bounded reference-error
-counts. Tables are classified as `absent`, `valid`, `invalid`, or `incomplete`
-(where their declared directory pages were missing). If an import descriptor
-lacks `OriginalFirstThunk`, recovery flags that the first-thunk/IAT path may
-contain relocated or resolved runtime pointers; original names are not invented.
+dumpy works without symbols. It reads the page tables, PEBs, loader lists, EPROCESS objects and VAD trees straight out of physical memory, and learns the structure offsets for the kernel build it finds in the capture. That includes builds with no published layout.
 
-New files under each recovery report directory:
+- Language: Rust (edition 2021), no external crates
+- Version: `dumpy --version` prints the build string. Every log line of a run starts with the same string, so you can always tell which binary produced a result.
 
-- `dumpy_pe_validation.tsv`: per-image import/export statuses, table sizes,
-  invalid references and suspected resolved-IAT indicator.
-- `dumpy_triage.tsv`: prioritized list of recovered files with file-backed
-  and executable coverage, import/export page gaps and table status.
+---
 
-The triage labels are `file-backed-complete`, `executable-complete`,
-`high-coverage` (at least 95% file-backed pages), and `partial-review`.
-These labels are **forensic prioritization**, not proof that a dumped image
-is an exact original on-disk PE or safe to execute. The scanner still bounds
-raw-root discovery and all import/export pointer dereferences.
+## Contents
 
-Full-memory test command:
+1. [Build](#build)
+2. [Quick start](#quick-start)
+3. [Commands](#commands)
+4. [How it works](#how-it-works)
+5. [Output layout](#output-layout)
+6. [Output tiers: what each recovered file is](#output-tiers-what-each-recovered-file-is)
+7. [Report reference (TSV columns)](#report-reference-tsv-columns)
+8. [Environment variables](#environment-variables)
+9. [Reading the log](#reading-the-log)
+10. [Limits and caveats](#limits-and-caveats)
+11. [Troubleshooting](#troubleshooting)
+12. [Testing](#testing)
 
-```powershell
-cargo test
-cargo clippy --all-targets -- -D warnings
+---
+
+## Build
+
+```bash
 cargo build --release
-.\dumpy.exe --recover-user .\complete.dmp .\full-user-v011 100000 301 512
+# binary: target/release/dumpy (dumpy.exe on Windows)
+cargo test --release
 ```
 
-For the **already extracted 4,530 images**, run the new offline verifier
-instead of repeating the full-memory scan:
+The release profile uses LTO. Nothing needs to be installed besides a Rust toolchain.
 
-```powershell
-.\dumpy.exe --verify-dir .\full-user-v010\raw_deduplicated
-```
+---
 
-This reads `.recovered.pe`, `.partial.bin`, and `.merged.bin` files in that
-directory, validates their PE headers/import/export references and writes
-`dumpy_existing_validation.tsv`. The offline report cannot infer which bytes
-were originally missing from RAM; the full recovery command additionally
-uses page-availability data to classify incomplete directory pages.
+## Quick start
 
-## v0.10.0: section-aware image completeness
-
-In addition to total mapped page availability, the recovery pipeline now
-calculates **file-backed page coverage** (headers plus section `SizeOfRawData`)
-and **executable file-backed page coverage** (sections with
-`IMAGE_SCN_MEM_EXECUTE`). The CSV-style TSV columns are:
-`file_backed_pages`, `missing_file_backed_pages`, `executable_pages`, and
-`missing_executable_pages`. A new `dumpy_sections.tsv` lists each PE section's
-name, RVA, raw-data byte count, executable flag, total file-backed pages and
-missing file-backed pages. The existing total `available_pages` and
-`missing_pages` remain as before, so missing uninitialized image tails are not
-mistaken for missing initialized executable bytes.
-
-The scanner **does not relabel incomplete mappings as complete executables**:
-page merging can still mix process-private modifications, import names can be
-rewritten in memory, and import/export tables can reference memory outside
-their declared directory byte ranges. `dumpy_sections.tsv` is forensic
-triage metadata, not proof of PE executability or original disk identity.
-
-Run `--recover-user` with your existing dump and a fresh output directory to
-generate the updated report schema.
-
-v0.9.6 removes the unused legacy `user_images::scan` wrapper and
-`MAX_IMAGES` constant after the new configurable `scan_limited` API was
-introduced. The synthetic page-table regression test now calls that API.
-
-## Automatic user-process PE recovery (v0.9.0)
-
-### v0.9.1 diagnostic update
-
-The user-image scanner checks **every present 4 KiB user page boundary**,
-including addresses not aligned to 64 KiB, and probes subpages of large
-mappings. Console diagnostics distinguish `mapped_pages` (present page-table
-entries), `readable_pages` (physical bytes available),
-`missing_physical_pages`, `mz_hits`, `rejected_pe` (invalid PE headers),
-`unaligned_pe`, missing page tables and unreadable candidate headers.
-A synthetic four-level page-table test covers a non-64 KiB-aligned PE and a
-present mapping whose physical page is absent from the capture.
-
-### v0.9.2 raw/padded full-memory exploration
-
-### v0.9.3 deduplicated raw recovery
-
-### v0.9.4 multi-DTB missing-page recovery
-
-### v0.9.5 configurable full-dump coverage
-
-The v0.9.4 test found **14,805 additional page recoveries across 88 merged
-images**, approximately 57.8 MiB. The most improved image at virtual base
-`0x7ff8199f0000` recovered 14,182 fallback pages and had 38,135 available
-pages after merging. The log also confirmed the previous cap of 32/301 roots,
-with several individual scans truncated at the 128-image ceiling.
-
-Raw-memory recovery now accepts two extra bounded arguments to increase those
-limits deliberately. Syntax:
-
-```powershell
-.\dumpy.exe --recover-user .\complete.dmp .\full-user-v095 100000 301 512
-```
-
-Arguments after the output directory are, in order:
-`max_mapped_pages` (default 100,000 for raw captures), `max_roots`
-(default 32), and `max_images_per_root` (default 128). Upper limits are
-100,000,000 pages, 8,192 roots and 4,096 images respectively. This expanded
-scan may take significantly longer and produce more candidates and temporary
-RAM usage; start with the defaults when testing a new acquisition. The
-page-table/PE safety checks and explicit truncation diagnostics remain intact.
-
-The v0.9.3 full-memory test reduced 1,195 raw PE candidates to **321 distinct
-header identities**, removing 874 redundant copies. The results were still
-mostly partial even when several address spaces mapped an identical PE header.
-
-Raw recovery now selects up to eight DTBs with the strongest sampled page
-coverage for each header identity. It reads each page from the preferred DTB
-first, and consults the other matching-header roots **only when that page is
-unavailable**. `dumpy_recovery.tsv` has a `fallback_pages` field, while
-`dumpy_page_sources.tsv` records the virtual address and supplying fallback
-DTB for every substituted page. The header identity is checked before roots
-are grouped. This does not establish that their modified private section
-pages are equivalent; cross-root compositions are named `*.merged.bin`, not
-`*.recovered.pe`, even if every page becomes readable. They are forensic
-composites, not guaranteed coherent executables.
-
-With very large images, fallback reads can be expensive; the eight-root bound
-prevents unbounded attempts. Existing missing-page and import/export status
-reporting remains intact.
-
-An actual full-memory test found 325 structural roots, 301 user-capable roots
-in the coherent cohort, and **1,195 PE candidates** across 32 scanned roots.
-Many were repeat views of the same DLL mapped at the same virtual base.
-
-Raw recovery now collects candidates before reconstruction, groups them by
-virtual base, declared image size, and a 64-bit fingerprint of the entire first
-PE header page, and chooses the DTB with the best readable-page coverage across
-up to 256 evenly spaced sample pages. It reconstructs only the chosen copy,
-instead of creating many similar partial images. A distinct PE header at the
-same address is **not** deduplicated. The full list of referring roots and
-the selected winner are saved in `raw_deduplicated/dumpy_raw_aliases.tsv`.
-Other reports and recovered images are written under `raw_deduplicated/`.
-
-The coverage rank is a sample, not a guarantee of the globally most complete
-mapping. The grouping also cannot prove two identical header pages have
-identical modified section contents. Use a fresh output directory to avoid
-confusing old v0.9.2 files with deduplicated output.
-
-`--recover-user` now handles inputs classified as `RawOrPadded` by attempting
-bounded **tentative flat-physical-memory** discovery. It scans for self-referencing
-PML4 pages, requires at least two candidate roots to share the same self-ref
-slot and matching non-self kernel mapping, then scans up to 32 root candidates
-with user mappings (100,000 present pages per root by default). Candidates
-are named by DTB rather than PID because a raw image lacks crash-header
-process metadata. Readable PE images are reconstructed with existing per-page
-missing-data accounting. Both acceptance and rejection of the flat mapping
-are printed as diagnostics; a structural candidate is evidence, **not proof**
-of the acquisition's physical address layout. Output must be validated.
+### 1. Identify the dump
 
 ```powershell
 .\dumpy.exe --info .\complete.dmp
-.\dumpy.exe --recover-user .\complete.dmp .\full-user-output
-# Optional per-root page budget:
-.\dumpy.exe --recover-user .\complete.dmp .\full-user-output 500000
 ```
 
-The full-dump search may take considerable time and can find no roots if
-CrowdStrike's acquisition contains non-flat data or physical-address gaps.
-No unverified file-header signature is treated as a valid physical page map.
+This reports the acquisition format: a Windows crash dump (`PAGEDU64`), or `RawOrPadded` for flat physical images such as WinPmem raw output, padded or unknown formats.
 
-The process-list and DTB heuristics validated against the supplied Windows 11
-kernel dump are now connected to user virtual-address scanning:
+### 2. Recover user-mode images, process by process (recommended)
+
+A large raw dump has hundreds of address spaces, so it's processed in **batches of roots**. Each batch writes its own tables, and they're merged into one view in the same output folder.
 
 ```powershell
-.\dumpy.exe --processes .\fred.dmp
-.\dumpy.exe --recover-user .\fred.dmp .\user-output
-# Optional: allow up to two million present logical pages per process
-.\dumpy.exe --recover-user .\fred.dmp .\user-output 2000000
+$v = .\dumpy.exe --version
+New-Item -ItemType Directory -Force .\out | Out-Null
+foreach ($start in 0..14 | % { $_ * 20 }) {
+    .\dumpy.exe --recover-process-aware .\complete.dmp .\out 200000 20 $start 4096 600 2>&1 |
+        Tee-Object -Append .\out\recover.log
+}
 ```
 
-This command requires **neither an image base nor a process DTB**. It discovers
-structural PML4 roots, traverses the active process list, and uses only processes
-with exactly one matching DTB candidate. It then walks four-level AMD64 paging
-tables in the user half of each process's address space, including 2 MiB and
-1 GiB large pages, probing 64 KiB-aligned present pages for validated PE
-headers (every 4 KiB page as of v0.9.1). Each discovered candidate is reconstructed through the existing
-page-aware PE recovery pipeline, with per-process `dumpy_recovery.tsv` and
-`dumpy_missing_pages.tsv` reports. A PE with absent pages is explicitly named
-`*.partial.bin` rather than misrepresented as a complete image.
+- `200000`: pages scanned per address space
+- `20`: address spaces (roots) per batch
+- `$start`: first root index of the batch. `0..14` × 20 covers 300 roots; widen the range if the log reports more roots discovered.
+- `4096`: maximum image recoveries per batch
+- `600`: maximum MiB for a single module
 
-The default scan budget is **500,000 present logical pages per process**,
-200,000 page tables and 128 candidates per process. The optional final argument
-changes the mapped-page budget. A truncated scan is reported explicitly.
+In the same folder:
 
-**Important limitations:** This is a bounded first-pass scanner; it detects
-4 KiB page-aligned PE headers only, and requires header pages and relevant
-page tables to be present in the captured memory. Process-list corruption
-currently stops traversal and is reported as `PARTIAL`; it does not establish
-that later processes are absent. Windows kernel crash dumps commonly exclude
-user pages, so zero recovered user images from `fred.dmp` is not proof that
-processes had no images. Full-memory acquisition is the appropriate test for
-user PE recovery. Process names, PIDs and DTB offsets remain heuristic without
-matched Windows type symbols; the user-image names are generic address-based
-labels. The recovered PE's import/export descriptors are preserved as present,
-but resolved IAT pointers cannot reliably be turned back into original import
-names from a single image alone.
+- **The first batch** builds `dumpy_eprocess.tsv` itself (see [EPROCESS scan](#4-eprocess-scan-pids-parents-times)) and turns on VAD resolution. Later batches reuse the file.
+- **Finished batches are never rerun.** Running the loop a second time is harmless: completed batches print `already completed; skipping`. Set `DUMPY_RERUN=1` to redo a batch on purpose.
 
+### 3. Optional: refresh PIDs, parents and times in the process table
 
-Build on Windows with `cargo build --release`, then run:
-
-```
-dumpy.exe "D:\path\memory.raw" "D:\recovered-pes"
+```powershell
+.\dumpy.exe --eprocess-scan .\complete.dmp .\out
 ```
 
-This is an incremental Rust 2021 implementation named **Dumpy**. It uses only the Rust standard library. The original three user files are kept intact in `original_reference/` for comparison. The current `src/` implementation is a rewrite; it does not yet retain all capabilities of those original files.
+This rewrites `dumpy_processes.tsv` with PID, parent, name, create/exit time and active-list membership, and writes `dumpy_eprocess.tsv`.
 
-## Changes
+### 4. Look at the results
 
-- Checks signed / malformed `e_lfanew`, signatures, header and section lengths, numeric overflow and truncation.
-- Scans in 8 MiB windows, including `MZ` signatures crossing window boundaries, with accurate absolute offsets.
-- Uses bounded, seek-based reads per candidate (600 MiB maximum PE image).
-- Reconstructs section-based, mapped images into disk layout when needed; preserves raw file-layout candidates when preferred.
-- Keeps import/export directory values and descriptor references as RVAs. Converting these to raw file offsets corrupts valid PEs.
-- Validates the presence and basic structure of import and export directories and reports damaged ones.
-- Names output by original byte offset so multiple candidates cannot overwrite one another.
-
-## Recovery limitations
-
-- A process memory image may have an overwritten IAT, missing bound-import data, relocated pointers, and absent overlays. Recovering *original* import tables from a loaded process can require reverse mapping the loaded DLL exports and reconstructing imports, which isn't possible solely from these file bytes.
-- The input may contain false-positive `MZ` byte patterns. A reported extracted file is structurally plausible, not guaranteed to be executable or malware-free.
-- In ambiguous cases where both raw and mapped layouts look plausible, this version prefers raw layout. Some mapped images without usable directories may need explicit mode selection.
-- PE overlays, certificates and appended data may be lost when the reported file size ends at the last section.
-- Rust compilation and runtime behavior must be verified on your Windows machine. The development environment used for this revision did not provide `cargo` or `rustc`.
-
-Test with `cargo test`, then `cargo clippy --all-targets -- -D warnings`.
-
-## Memory-aware foundation (v0.3)
-
-The existing two-argument invocation still runs physical signature carving.
-New commands:
-
-```
-dumpy.exe --info "D:\capture.raw"
-dumpy.exe --discover "D:\capture.raw"
-dumpy.exe --modules "D:\kernel.dmp"
-dumpy.exe --virtual "D:\capture.raw" 0x1aa000 0x7ff700000000 "D:\output\recovered.exe" 4
+```powershell
+Get-ChildItem .\out\images -File | Group-Object { ($_.Name -split '\.')[-2..-1] -join '.' } | Select-Object Count, Name
 ```
 
-The `--virtual` mode requires a **verified flat physical memory image**, the process's
-directory table base (DTB/CR3), and the mapped image virtual base. The example
-addresses are placeholders, not values discovered from your dump.
+The images to analyse are `*.recovered.pe` and `*.code-complete.pe`. See [Output tiers](#output-tiers-what-each-recovered-file-is).
 
-It supports AMD64 4-level and 5-level paging and 4 KiB, 2 MiB, and 1 GiB pages.
-It reads each virtual page using its page-table translation and fails explicitly
-on absent pages, avoiding silent zero-filling. It then reconstructs section data
-into the PE's raw file layout while retaining import and export RVAs.
+---
 
-**Not implemented:** automatic Windows kernel/process discovery, process-specific DTB retrieval,
-Microsoft PDB type resolution, minidump streams,
-or reconstruction of imports whose names were overwritten by resolved IAT entries.
-The `--info` classification `RawOrPadded` means only that known crash/minidump
-signatures were not detected; it is not positive proof that file offsets are
-physical addresses. Do not use `--virtual` without independently verifying that.
+## Commands
 
-### Experimental candidate discovery
+| Command | Purpose |
+|---|---|
+| `--version` | Print the build string. |
+| `--info <dump>` | Identify the acquisition format and size. |
+| `--recover-process-aware <dump> <out> [pages=100000] [roots=8] [root_start=0] [max_recoveries=4096] [max_module_mib=600]` | **Main workflow.** Discover address spaces, find PEBs, walk loader lists, recover images, report unlisted images and orphan executable memory. |
+| `--process-scan <dump> <out> [pages] [roots] [root_start]` | Same discovery and reports as above, without recovering images. |
+| `--eprocess-scan <dump> <out>` | Locate EPROCESS objects and learn their layout. Fills PID, PPID, name, create/exit time and active-list membership. Needs `dumpy_processes.tsv` in `<out>`. |
+| `--verify-dir <dir>` | Re-validate every recovered file in a directory (`.recovered.pe`, `.code-complete.pe`, `.inconsistent.bin`, `.partial.bin`, `.merged.bin`). |
+| `--dump-range <dump> <dtb_hex> <va_hex> <len_hex> <out.bin>` | Read an arbitrary virtual range of one address space to a file, for manual inspection. |
+| `--probe-image <dump> <dtb_hex> <base_hex> <out_dir>` | Recover one image at a known base in a known address space. |
+| `--virtual <flat_dump> <dtb_hex> <base_hex> <out.exe> [4\|5]` | Rebuild one image through 4- or 5-level paging. |
+| `--recover-user <dump> <out> [max_mapped_pages] [max_roots] [max_images_per_root]` | Older user-mode carve, not driven by PEBs. Prefer `--recover-process-aware`. |
+| `--discover <verified_flat_dump>` | List candidate page-table roots. |
+| `--modules <crash_dump>` / `--processes <crash_dump>` | List kernel modules or processes from a Windows crash dump. |
+| `--recover-kernel <crash_dump> <out>` | Recover kernel modules from a Windows crash dump. |
+| `<dump> <out>` | Default: kernel-module recovery for crash dumps; for anything else, a linear MZ carve of physical memory (no address-space attribution). |
 
-`--discover` now scans for structurally plausible self-referencing AMD64 PML4
-pages, without asking the user for a DTB. This is an **initial heuristic**:
-Windows configurations without a self-referencing top-level page-table entry
-may not appear; a candidate is not yet a validated process root; it is not
-automatically fed into PE recovery. Future kernel/PDB validation is necessary
-before connecting discovered roots to process enumeration. At most 4096
-candidates are retained and the first 100 are printed.
+The total scan budget per run (`pages × roots`) is capped at 8,000,000 pages. Use more batches rather than larger ones.
 
-### PAGE/DU64 crash dumps
+---
 
-The program now parses Windows x64 crash dump headers, run-based (`DumpType=1`)
-and bitmap-selected (`DumpType=5` full; `DumpType=6` kernel) physical pages. It maps physical addresses
-to their stored file offsets for paging and discovery. Other dump types and
-unknown bitmap variants fail explicitly. `--info` prints crash metadata and
-captured range counts. On a recognized crash dump, the normal two-argument
-command now performs kernel module PE recovery **without** incorrect raw PE
-carving. User-process recovery is not implemented yet.
+## How it works
 
-Version 0.5.2 parses the modern `SDMP`/`FDMP` bitmap subheader at file offset
-`0x2000`, with 64-bit FirstPage metadata (`+0x20`), present-page count (`+0x28`),
-bitmap bit count (`+0x30`), and bitset (`+0x38`). The source validates the
-captured-page count and the recorded first-page location against the dump file
-size before mapping. This layout is different from the older summary header
-with 32-bit fields near its start.
+### 1. Address spaces
+- **Root discovery.** Page-table roots (PML4s) are found by their self-referencing entries and checked for coherence (user and kernel halves present, entries pointing inside the capture). 4- and 5-level paging are both supported.
+- **The kernel root** (System's CR3) is the root with the most kernel mappings. It's used to read kernel structures: EPROCESS, VAD nodes and prototype PTEs.
 
-### Kernel module enumeration (v0.6.0)
+### 2. Translation
+Besides hardware-valid PTEs, dumpy resolves Windows software PTEs, with per-page provenance:
 
-`--modules <PAGE/DU64 dump>` walks the kernel's `PsLoadedModuleList` using the
-DTB, list-head address and physical-page mapping from the crash header.
-It bounds traversal, checks backlink consistency and cycles, tries several
-candidate x64 loader entry layouts, and validates each proposed image base
-against a mapped PE signature. A module's Unicode name is printed only if
-readable. This is a validated heuristic, not symbol-based identification of
-the exact `KLDR_DATA_TABLE_ENTRY` layout. Some modules may be skipped when
-their pages are absent or the layout differs. `--modules` lists metadata only;
-use `--recover-kernel` or the normal two-argument command to rebuild images.
+| Mechanism | When it applies | Provenance column |
+|---|---|---|
+| Transition PTE | Valid=0, Transition=1: the page is on the standby/modified list and still in RAM. | `transition_pages` |
+| Prototype PTE | Valid=0, Prototype=1: a pointer to the section's shared prototype PTE, read through the kernel root. | `prototype_pages` |
+| VAD walk | No PTE at all (the page table is absent or the entry is zero): look up the process's VAD tree, take `FirstPrototypePte[page]`, and resolve that. | `vad_pages` |
+| PFN unswizzle | Software-PTE PFNs that point beyond the capture with SwizzleBit clear. | (silent) |
 
-As of 0.6.2, an invalid later link yields a **PARTIAL** traversal report and
-prints every previously validated module. The mismatch remains in diagnostics;
-the scanner does not skip or follow the damaged link. This supports kernel
-dumps whose capture is missing a list page while distinguishing recovered
-entries from an entirely validated list.
+`DUMPY_STRICT_PTE=1` turns off everything except hardware-valid PTEs.
 
-### Kernel module PE recovery (v0.7.0)
+### 3. Processes and modules
+- **PEB discovery** scans only private read-write, non-executable pages. It also follows TEBs (`NT_TIB.Self` at +0x30 and the PEB pointer at +0x60), and requires the `Mutant == -1` gate.
+- **Loader lists** are walked in both directions over all three lists (load, memory and initialisation order), tolerating gaps. `ldr_complete` records whether the lists closed.
+- **Identity:** each image is keyed by `(base, SizeOfImage, header fingerprint)` across all address spaces, so a shared DLL is recovered once. Identities carry over between batches through `images/dumpy_identities.tsv`.
 
-For Windows crash dumps, the normal two-argument command now enumerates the
-validated kernel modules and attempts PE recovery from each module's virtual
-memory pages:
+### 4. EPROCESS scan (PIDs, parents, times)
+Physical memory is scanned for the DTB values of known address spaces. A hit counts as an EPROCESS only when a validated PEB sits at a fixed distance from it. From those confirmed objects dumpy learns, without symbols:
 
-```
-dumpy.exe "C:\captures\memory.dmp" "C:\output\Dumpy"
-```
+- `Peb`, `UniqueProcessId`, `ActiveProcessLinks`, `InheritedFromUniqueProcessId`, `CreateTime`, `ExitTime` and `ImageFileName`;
+- the DTB field position, confirmed by a `DISPATCHER_HEADER` with Type 3 at field − 0x28.
 
-Equivalent explicit command:
+Duplicate copies of the same process, caused by acquisition smear, are grouped by DTB plus PEB. Linkage and exit time are judged per group. A second "shape" pass finds exited processes whose address space is gone.
 
-```
-dumpy.exe --recover-kernel "C:\captures\memory.dmp" "C:\output\Dumpy"
-```
+Twenty validated processes are enough to learn the layout.
 
-The new `src/recovery.rs` reads the mapped images page by page and reconstructs
-raw section layout. Outputs with every page readable receive `.recovered.pe`;
-outputs with at least one missing page are written as `.partial.bin`. Those
-partial files are **not** guaranteed executable and must not be presented as
-faithful complete images. Reports `dumpy_recovery.tsv` and
-`dumpy_missing_pages.tsv` describe availability and structural validation.
-The recovery report additionally distinguishes missing PE header, import
-directory and export directory pages from other missing sections.
+### 5. VAD resolution
+`EPROCESS.VadRoot` and `MMVAD.FirstPrototypePte` are learned from the capture:
 
-Missing pages are zero-filled in the partial buffer solely to preserve virtual
-offsets for section reconstruction. The reports identify these missing areas.
-Original import-name data overwritten by loader-resolved IAT entries is not
-reconstructed. This version covers kernel modules, not automatic user-process
-PE recovery. Inspect recovered output with an independent PE parser.
+- **VadRoot:** the EPROCESS field that roots the largest valid binary search tree covering the process's PEB, agreed across processes.
+- **FirstPrototypePte:** the MMVAD field whose prototype PTEs name the same physical frames as the hardware PTEs of pages the process did touch.
 
-### Process discovery candidates (v0.8.0)
+The node header (RTL_BALANCED_NODE plus the MMVAD_SHORT VPN fields) is checked by structure, not assumed.
+
+### 6. Recovery
+- **Pages** come from the image's own address space first. A missing page is borrowed from another address space that maps the same identity only when it is a shared image page: headers, or a non-writable section. A third address space is read as a second opinion, and any disagreement counts as a conflict.
+- **Rebuild:** dumpy chooses mapped or raw layout from evidence, rebuilds the file, and validates the import and export tables.
+- **Naming**, in order: loader list, export-directory name, VERSIONINFO (`OriginalFilename` / `InternalName`), .NET Module name, then the CodeView PDB name. Roslyn script submissions are labelled.
+
+### 7. Review sets
+- **Unlisted images:** PE headers mapped in an address space but missing from its loader list.
+- **Orphan executable regions:** executable user memory not covered by any known image. Each one is classified by content and by the runtime it belongs to (.NET, V8/Chromium/Electron/CEF, JScript, JVM, CrowdStrike UMPPC).
+
+---
+
+## Output layout
 
 ```
-dumpy.exe --processes "C:\captures\memory.dmp"
+out/
+├── recover.log                         (from Tee-Object)
+├── dumpy_processes.tsv                 address spaces with a validated PEB (merged)
+├── dumpy_modules.tsv                   loader-list modules (merged)
+├── dumpy_unlisted_images.tsv           PEs not in any loader list (merged)
+├── dumpy_orphan_executable.tsv         executable memory outside known images (merged)
+├── dumpy_skipped_modules.tsv           modules not recovered, with reason (merged)
+├── dumpy_eprocess.tsv                  EPROCESS objects (built by batch 0 or --eprocess-scan)
+├── dumpy_eprocess_lookalikes.tsv       DTB-holding objects that are not processes
+├── dumpy_<table>.r<start>-<end>.tsv    per-batch tables (merged into the above)
+├── .dumpy_batch_r<start>-<end>.done    batch completion markers
+├── dtb_<dtb>_orphans/                  bytes of orphan executable regions
+└── images/
+    ├── <name>_0x<base>.recovered.pe
+    ├── <name>_0x<base>.code-complete.pe
+    ├── <name>_0x<base>.inconsistent.bin
+    ├── <name>_0x<base>.merged.bin
+    ├── <name>_0x<base>.partial.bin
+    ├── dumpy_recovery.tsv              one row per recovered identity (merged)
+    ├── dumpy_missing_pages.tsv         every page not recovered, with reason
+    ├── dumpy_page_sources.tsv          pages borrowed from another address space
+    ├── dumpy_sections.tsv              per-section coverage
+    ├── dumpy_pe_validation.tsv         import/export table audit
+    ├── dumpy_triage.tsv                priority-sorted summary
+    ├── dumpy_identities.tsv            identity registry shared by batches
+    └── batch_r<start>-<end>/           per-batch copies of the image reports
 ```
 
-The initial `src/processes.rs` walks `PsActiveProcessHead` through the captured
-kernel DTB, validates list pointers, reads the adjacent PID field as a **hint**,
-and searches nearby process-object memory for candidate page-table roots that
-match the separately discovered PML4 pages. Candidate names and roots are
-reported without claiming that the EPROCESS layout is verified. Dynamic PDB
-layout resolution and user-mode module enumeration are still required for
-reliable cross-version process identity and executable recovery.
-Version 0.8.1 additionally searches memory following `ActiveProcessLinks` for
-plausible `ImageFileName` strings and displays relative locations of candidate
-DTB fields. Equal relative offsets across several processes provide evidence
-for a shared EPROCESS layout, but are not a substitute for matching symbols.
-Version 0.8.2 selects an image-name field offset only when at least two
-independent process objects agree, then re-reads each fixed-size name field
-from that common offset. This avoids reporting the substring `System` inside
-`Secure System` as the complete process name. Relative DTB offsets now display
-as signed hexadecimal values instead of wrapped unsigned numbers.
+Images without a name are written as `image_<base>_h<fingerprint>…`.
 
-See `ARCHITECTURE.md` for a precise inventory of what's implemented, the
-proposed module split, format compatibility boundaries, and validation criteria.
+---
+
+## Output tiers: what each recovered file is
+
+| Suffix | `completeness` | Meaning | Use for analysis? |
+|---|---|---|---|
+| `.recovered.pe` | `exact` | Every page present, and the import/export tables parse (or are absent). | **Yes** |
+| `.code-complete.pe` | `code-complete` | Headers, every executable page, and the import/export directories came from memory and validate. Only non-executable data (typically `.rsrc`, `.reloc`, `.data` pages never touched) is zero-filled; the diagnostics column lists what. | **Yes**: loadable and analysable, but not byte-identical to disk |
+| `.inconsistent.bin` | `inconsistent` | Every page present, but the pages are not one image: either the tables don't parse, or a kernel driver header (ImageBase in kernel space) sits over a user mapping. Caused by stale PTEs or acquisition smear. | No; look only if you're chasing that address |
+| `.merged.bin` | `merged` | Needed a writable (per-process) page from another address space, or address spaces disagreed on a shared page. | With care |
+| `.partial.bin` | `partial` | Pages missing beyond the code-complete bar; missing pages are zero-filled. | For strings and YARA, not execution |
+| (no file) | `unavailable` | Nothing recoverable, or section reconstruction failed. | n/a |
+
+A recovered file is a **rebuild from memory**:
+- Its hash will not match the on-disk file.
+- Authenticode signatures don't survive, because the certificate table is never mapped. `Get-AuthenticodeSignature` will report `NotSigned` even for signed binaries.
+
+Use the `pdb_key` column (GUID plus age) to identify the exact build instead.
+
+---
+
+## Report reference (TSV columns)
+
+### `images/dumpy_recovery.tsv`
+
+| Column | Meaning |
+|---|---|
+| `name` | Image name. A source suffix in parentheses shows where it came from: `(export name)`, `(version resource)`, `(.NET module)`, `(.NET module, Roslyn script submission)`, `(pdb name)`. No suffix means the loader list. |
+| `base`, `image_bytes` | Virtual base address and SizeOfImage. |
+| `available_pages`, `missing_pages` | Page counts. |
+| `missing_header`, `missing_import`, `missing_export` | Missing pages that hold the headers, import tables or export tables. |
+| `file_backed_pages`, `missing_file_backed_pages` | Pages backed by file content (sections with raw data). |
+| `executable_pages`, `missing_executable_pages` | Pages in executable sections. |
+| `fallback_pages` | Pages borrowed from another address space; split into `fallback_shared_pages` (headers or read-only sections), `fallback_private_pages` (writable sections) and `fallback_conflicts` (a third mapping disagreed). |
+| `transition_pages`, `prototype_pages`, `vad_pages` | Pages resolved through software PTEs (see [Translation](#2-translation)). |
+| `completeness` | Output tier (see table above). |
+| `priority` | `file-backed-complete`, `executable-complete`, `high-coverage` (≥95% file-backed), `partial-review`, `incoherent-review`. |
+| `import_status`, `export_status` | `valid`, `absent`, `invalid` or `incomplete` (plus raw and mapped variants of each). |
+| `layout` | Layout the rebuild was based on: `mapped-image` or `raw-file-view`. |
+| `executable_utf16_ascii_ratio`, `incoherent_warning` | Flags executable sections that hold text instead of code. |
+| `pdb`, `pdb_key` | CodeView PDB path and symbol-server key (GUID with no dashes, then age in hex). |
+| `clr_module` | .NET Module name, when present. |
+| `output`, `diagnostics` | Written file, and a plain-language summary including zero-filled sections. |
+
+### `images/dumpy_missing_pages.tsv`
+`name`, `virtual_address`, `reason`. Reasons name the mechanism that stopped the walk:
+
+| Reason | Meaning |
+|---|---|
+| `PT/PD/PDPT/PML4 zero: never touched, VAD/section only` | No PTE. Normally resolved through the VAD; seen only when VAD resolution is off. |
+| `PT prototype: file-backed, not in RAM` | The page was never read from disk. **Not in the dump.** |
+| `PT prototype PTE itself unmapped` | The prototype PTE array lives in paged-out pool. |
+| `PT prototype: paged out` / `PD/PT pagefile` | The page is in the pagefile. Not in the dump. |
+| `PT demand zero` / `VAD: private memory, never touched` | Never-allocated private memory. |
+| `VAD: no VAD covers address` | Address outside any VAD. |
+| `physical page absent` | The PFN points beyond the capture. |
+
+Each batch's log ends with a `[missing-census]` summary of these reasons.
+
+### `dumpy_processes.tsv`
+`dtb`, `peb`, `bitness`, `image_base`, `pid_hint`, `name_hint`, `ldr`, `modules`, `ldr_entries`, `ldr_complete`, `skipped_headers`, `known_identity_headers`, `pass`, `readable_pages`, `private_rw_pages`, `teb_hits`, `transition_pages`, `truncated`, `wow64_peer`. After `--eprocess-scan`, five more columns are added: `ppid`, `create_time_utc`, `exit_time_utc`, `in_active_list` and `state`.
+
+### `dumpy_modules.tsv`
+`dtb`, `peb`, `base`, `size_of_image`, `name`, `ldr_lists` (which of the three lists hold the module), `header_source` (`memory` or `known-identity`), `fingerprint`, `listed_in_roots`, `rx_pages`, `ldr_complete`.
+
+### `dumpy_unlisted_images.tsv`
+`attribution` is one of:
+- `unlisted`: the process's loader list is complete and doesn't contain this image. **Review these.**
+- `unlisted-ldr-incomplete`: the loader list didn't close, so the image may simply have been missed.
+- `unattributed`: the address space has no validated PEB.
+
+Other columns: `rx_pages`, `aligned_64k`, `known_elsewhere` / `known_name` (the same identity is listed in another process), `same_header_as`, `pe_summary` (kind, machine, timestamp, sections, imports, exports), `output`.
+
+### `dumpy_orphan_executable.tsv`
+Executable user memory outside every known image. Columns:
+- `process_runtime`: the runtime the owning process belongs to, from its modules (.NET, V8 and so on).
+- `content_class`: `code`, `text`, `binary` or `mostly-zero`.
+- `overlaps_known_module`, `content_match` (page-hash match against recovered images), `probable_base`, `probable_base_status`.
+- `large_page`, and `first_page_physical` (marked `beyond capture: stale PTE` when the PTE points outside the dump).
+
+### `dumpy_eprocess.tsv`
+
+| Column | Meaning |
+|---|---|
+| `source` | `dtb-anchored` (found by DTB value) or `shape` (exited process found by structure). |
+| `state` | `running`, `exited`, `exited(page tables still in RAM)`, `exited(this copy imaged before exit)`, `no-exit-time,root-missing`, `root-missing`. |
+| `pid`, `ppid`, `name`, `create_time_utc`, `exit_time_utc` | From the learned layout. Names are ImageFileName, truncated to 14 characters by Windows. |
+| `in_active_list`, `group_linked` | Whether this copy, and whether any copy of the process, is reachable from ActiveProcessLinks. **Use `group_linked`** to judge whether a process is unlinked. |
+| `duplicate_of` | Physical address of the first copy of the same process. |
+| `eprocess_va`, `eprocess_phys`, `dtb`, `peb`, `peb_confirmed`, `plausible` | Location and validation. |
+
+Objects that hold a DTB value but don't read as a process go to `dumpy_eprocess_lookalikes.tsv`.
+
+---
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `DUMPY_RERUN=1` | Redo a batch that already finished in this output folder. Its identities are recovered again and its tables rebuilt. |
+| `DUMPY_STRICT_PTE=1` | Hardware-valid PTEs only: no transition, prototype or VAD resolution. |
+| `DUMPY_EPROCESS_ALL=1` | Keep look-alike objects in `dumpy_eprocess.tsv` instead of the sidecar file. |
+
+---
+
+## Reading the log
+
+| Line | Meaning |
+|---|---|
+| `[process-aware] dumpy <version>` | The binary that produced this batch. |
+| `[process-aware] N roots discovered; scanning indices a..b` | Total address spaces found, and the range this batch covers. |
+| `[vad] building …dumpy_eprocess.tsv from N anchored address spaces` | First batch in a new folder; the EPROCESS file is being built. |
+| `[vad] EPROCESS.VadRoot=+0x… … installed for X of Y address spaces` | VAD resolution is on. Expect X close to Y. |
+| `[vad] VAD resolution off: …` | VAD resolution is off, with the reason. Coverage will be noticeably lower. |
+| `[missing-census] …` | Why the pages still missing in this batch are missing. |
+| `[recover] <name> base=… available=… missing=…` | One recovery, with its diagnostics. |
+| `already completed; skipping` | Finished batch skipped (see `DUMPY_RERUN`). |
+| `[eprocess] absolute EPROCESS offsets: …` | The learned layout for this kernel build. |
+
+---
+
+## Limits and caveats
+
+- **Memory holds only what was read.** Windows maps an entire image but reads only the pages a process touches. On a typical capture most still-missing image pages are `file-backed, not in RAM`; no memory-side technique can recover them, and they come out zero-filled.
+- **Acquisition smear.** Live captures are taken over minutes. Objects can appear twice with drifting counters, and a PTE can point at a frame that was reused mid-capture. dumpy groups duplicate EPROCESS copies, checks shared pages against a second address space, and moves images whose pages don't form one image to the `inconsistent` tier.
+- **Freed page tables.** A self-referencing PML4 can outlive its process. `dumpy_eprocess.tsv` marks such address spaces `exited(page tables still in RAM)`.
+- **Learned, not looked-up, offsets.** EPROCESS and VAD offsets are inferred and printed in the log. If the log shows low support counts, treat PIDs, names and times as provisional.
+- **Not handled:** VAD-prototype PTE encoding (`ProtoAddress == 0xFFFFFFFF0000`), pagefile content, and the PFN database. That last one would recover pages whose prototype PTEs are in paged-out pool.
+- **KVA shadowing:** detected and reported. On shadowed systems the roots found are user CR3s.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Columns or tiers described here are missing from your output | Stale binary. Check `--version` and the first log line of every batch. |
+| `process scan budget … exceeds safe cap` | `pages × roots` is above 8,000,000. Use smaller batches. |
+| `[vad] VAD resolution off: … not found` with an old binary | Versions before 0.14 needed `dumpy_eprocess.tsv` copied in. Current versions build it in batch 0. |
+| `EPROCESS scan failed: no EPROCESS objects confirmed` | Too few validated PEBs, or an unusual layout. Run more batches into the folder (more anchors), then run `--eprocess-scan` on it. The `tried +0x… scores:` lines show which field failed to learn. |
+| Results look truncated after running the loop twice into one folder | Pre-0.14.1 behaviour. Current versions skip finished batches. Start a fresh folder for a clean set. |
+| `Tee-Object : … DirectoryNotFound` | Create the output folder before the loop (`New-Item -ItemType Directory -Force`). |
+| `Get-AuthenticodeSignature` says `NotSigned` | Expected for any rebuilt image; see [Output tiers](#output-tiers-what-each-recovered-file-is). |
+
+---
+
+## Testing
+
+```bash
+cargo test --release
+```
+
+Unit tests cover:
+- page-table classification, gap merging and coalescing;
+- PEB and loader-list walking, including incomplete lists;
+- EPROCESS layout learning and image-name rules;
+- PDB and .NET naming, including non-ASCII Roslyn names;
+- export and version naming;
+- PE validation.
+
+`tests_fixture_make_flat.py` builds `flat.bin`, a synthetic flat physical image that exercises the whole pipeline:
+- two address spaces and a System-like kernel root;
+- a PEB reached through a TEB, and a loader list;
+- a shared DLL that needs a borrowed read-only page;
+- a DLL whose `.data` page exists only in another process (expected tier `merged`);
+- a DLL whose `.data` was never touched (expected tier `code-complete`);
+- an unlisted image and an orphan executable page;
+- a prototype-pointer PTE;
+- EPROCESS-like objects with `DISPATCHER_HEADER`s;
+- a three-node VAD tree with prototype PTE arrays.
+
+```bash
+python3 tests_fixture_make_flat.py          # writes flat.bin
+dumpy --recover-process-aware flat.bin out_fixture
+ls out_fixture/images                       # expect recovered.pe ×2, code-complete.pe, merged.bin
+```
+
+The first batch builds the EPROCESS file and learns `VadRoot=+0x700` and `FirstPrototypePte=+0x50` from the fixture.

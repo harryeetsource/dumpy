@@ -57,8 +57,13 @@ pub struct RecoveryRecord {
     pub prototype_pages: usize,
     /// Pages with no PTE, resolved through the VAD tree.
     pub vad_pages: usize,
-    /// exact | code-complete | merged | partial | unavailable
+    /// exact | code-complete | inconsistent | merged | partial | unavailable
     pub completeness: &'static str,
+    /// CodeView PDB path and symbol-server key (GUID+age), and the .NET
+    /// Module name, read from the rebuilt image.
+    pub pdb_path: String,
+    pub pdb_key: String,
+    pub clr_name: String,
     pub sections: Vec<SectionCoverage>,
     pub audit: Option<PeAudit>,
     pub priority: &'static str,
@@ -167,7 +172,7 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
         fallback_sources: Vec::new(), fallback_shared_pages: 0, fallback_private_pages: 0,
         fallback_conflicts: 0, file_backed_pages: 0,
         missing_file_backed_pages: 0, executable_pages: 0,
-        missing_executable_pages: 0, transition_pages: 0, prototype_pages: 0, vad_pages: 0, completeness: "unavailable", sections: Vec::new(), audit: None,
+        missing_executable_pages: 0, transition_pages: 0, prototype_pages: 0, vad_pages: 0, completeness: "unavailable", pdb_path: String::new(), pdb_key: String::new(), clr_name: String::new(), sections: Vec::new(), audit: None,
         priority: "unavailable", layout: "unknown", layout_evidence: LayoutEvidence::default(),
         executable_utf16_ratio: 0.0, incoherent_warning: false };
     if size == 0 || size > MAX_IMAGE {
@@ -243,6 +248,10 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
     };
     record.layout = layout;
     record.layout_evidence = evidence;
+    if let Ok(out_pe) = Pe::parse(&rebuilt) {
+        if let Some((path, key)) = out_pe.pdb_info(&rebuilt) { record.pdb_path = path; record.pdb_key = key; }
+        if let Some(name) = out_pe.clr_module_name(&rebuilt) { record.clr_name = name; }
+    }
     let mut audit = pe_verify::validate(&pe, &rebuilt);
     let raw_view = layout == "raw-file-view";
     let directory_start = |rva: u32| -> u64 {
@@ -322,6 +331,7 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
     record.incoherent_warning = profile.strongly_text_like() &&
         audit.imports.status == "invalid" && audit.exports.status == "invalid" &&
         record.missing_file_backed_pages == 0 && record.fallback_private_pages == 0;
+    let table_status = format!("imports={} exports={}", audit.imports.status, audit.exports.status);
     let tables_ok = matches!(audit.imports.status, "valid" | "absent") &&
         matches!(audit.exports.status, "valid" | "absent");
     record.priority = if record.incoherent_warning {
@@ -345,15 +355,29 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
     // directories came from memory and validate; only non-executable data
     // (typically .rsrc/.reloc/.data the process never touched) is
     // zero-filled. Loadable and analysable, but not byte-identical to disk.
-    let code_complete = !complete && coherent_merge && !record.incoherent_warning &&
+    // A header whose ImageBase field is a kernel address, found at a user
+    // VA, belongs to a loaded driver whose frame this mapping now points at
+    // (stale PTE or acquisition smear): the pages after it are unrelated.
+    let header_image_base = {
+        let nt = u32::from_le_bytes(mapped.get(0x3c..0x40).and_then(|v| v.try_into().ok()).unwrap_or([0; 4])) as usize;
+        let at = nt + 24 + if pe.is_64 { 24 } else { 28 };
+        if pe.is_64 { mapped.get(at..at + 8).map(|v| u64::from_le_bytes(v.try_into().unwrap())) }
+        else { mapped.get(at..at + 4).map(|v| u32::from_le_bytes(v.try_into().unwrap()) as u64) }
+    };
+    let foreign_header = module.image_base >> 47 == 0 && header_image_base.is_some_and(|b| b >> 47 != 0);
+    // All pages present but the tables they hold do not parse: the pages
+    // come from different owners, so "complete" would overstate it.
+    let consistent = tables_ok && !foreign_header;
+    let code_complete = !complete && coherent_merge && !record.incoherent_warning && !foreign_header &&
         record.missing_header_pages == 0 && record.executable_pages > 0 &&
         record.missing_executable_pages == 0 && record.missing_import_pages == 0 &&
         record.missing_export_pages == 0 && tables_ok;
     record.completeness = if record.fallback_pages > 0 && !coherent_merge { "merged" }
-        else if complete { "exact" } else if code_complete { "code-complete" } else { "partial" };
+        else if complete && consistent { "exact" } else if complete { "inconsistent" }
+        else if code_complete { "code-complete" } else { "partial" };
     let filename = format!("{}_0x{:016x}.{}", safe_name(&name), module.image_base,
         match record.completeness { "merged" => "merged.bin", "exact" => "recovered.pe",
-            "code-complete" => "code-complete.pe", _ => "partial.bin" });
+            "code-complete" => "code-complete.pe", "inconsistent" => "inconsistent.bin", _ => "partial.bin" });
     let zero_filled = record.sections.iter().filter(|s| s.missing_pages > 0)
         .map(|s| format!("{} {}/{}", s.name, s.missing_pages, s.pages)).collect::<Vec<_>>();
     let destination = dir.join(filename);
@@ -366,6 +390,9 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
             ("exact", true) => "complete pages (shared image pages borrowed from other processes)".to_string(),
             ("exact", false) => "complete pages".to_string(),
             ("code-complete", _) => format!("code-complete: headers, code and import/export tables from memory; zero-filled: {}", zero_filled.join(" ")),
+            ("inconsistent", _) => format!("all pages present but not one image: {}",
+                if foreign_header { format!("header ImageBase {:#x} is a kernel address (driver header over a user mapping)", header_image_base.unwrap_or(0)) }
+                else { format!("{table_status} do not parse") }),
             (_, true) => "partial pages (shared image pages borrowed from other processes)".to_string(),
             _ => "partial pages".to_string(),
         }, record.layout, record.priority,
@@ -379,11 +406,11 @@ pub fn recover_from_roots(memory: &mut PhysicalMemory<'_>, dtbs: &[u64],
 }
 
 pub fn write_report(dir: &Path, records: &[RecoveryRecord]) -> io::Result<()> {
-    let mut report = String::from("name\tbase\timage_bytes\tavailable_pages\tmissing_pages\tfallback_pages\tmissing_header\tmissing_import\tmissing_export\tfile_backed_pages\tmissing_file_backed_pages\texecutable_pages\tmissing_executable_pages\toutput\tdiagnostics\tpriority\timport_status\texport_status\tlayout\traw_import_status\traw_import_descriptors\traw_import_symbols\tmapped_import_status\tmapped_import_descriptors\tmapped_import_symbols\traw_export_status\tmapped_export_status\texecutable_utf16_ascii_ratio\tincoherent_warning\ttransition_pages\tfallback_shared_pages\tfallback_private_pages\tfallback_conflicts\tprototype_pages\tvad_pages\tcompleteness\n");
+    let mut report = String::from("name\tbase\timage_bytes\tavailable_pages\tmissing_pages\tfallback_pages\tmissing_header\tmissing_import\tmissing_export\tfile_backed_pages\tmissing_file_backed_pages\texecutable_pages\tmissing_executable_pages\toutput\tdiagnostics\tpriority\timport_status\texport_status\tlayout\traw_import_status\traw_import_descriptors\traw_import_symbols\tmapped_import_status\tmapped_import_descriptors\tmapped_import_symbols\traw_export_status\tmapped_export_status\texecutable_utf16_ascii_ratio\tincoherent_warning\ttransition_pages\tfallback_shared_pages\tfallback_private_pages\tfallback_conflicts\tprototype_pages\tvad_pages\tcompleteness\tpdb\tpdb_key\tclr_module\n");
     for item in records {
         let imports = item.audit.as_ref().map(|a| a.imports.status).unwrap_or("unavailable");
         let exports = item.audit.as_ref().map(|a| a.exports.status).unwrap_or("unavailable");
-        report.push_str(&format!("{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        report.push_str(&format!("{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             clean_field(&item.name), item.base, item.image_size, item.available_pages,
             item.missing_pages.len(), item.fallback_pages, item.missing_header_pages, item.missing_import_pages,
             item.missing_export_pages, item.file_backed_pages, item.missing_file_backed_pages,
@@ -396,7 +423,8 @@ pub fn write_report(dir: &Path, records: &[RecoveryRecord]) -> io::Result<()> {
             item.layout_evidence.raw_export, item.layout_evidence.mapped_export,
             item.executable_utf16_ratio, item.incoherent_warning, item.transition_pages,
             item.fallback_shared_pages, item.fallback_private_pages, item.fallback_conflicts,
-            item.prototype_pages, item.vad_pages, item.completeness));
+            item.prototype_pages, item.vad_pages, item.completeness,
+            clean_field(&item.pdb_path), item.pdb_key, clean_field(&item.clr_name)));
     }
     fs::create_dir_all(dir)?;
     fs::write(dir.join("dumpy_recovery.tsv"), report)?;

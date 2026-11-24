@@ -22,7 +22,7 @@ use std::io::Write;
 use std::path::Path;
 
 /// Bumped on every report-format change so a log line identifies the build.
-pub const VERSION: &str = "0.12.0 (2026-11-23 code-complete tier: headers+code+tables from memory -> .code-complete.pe)";
+pub const VERSION: &str = "0.14.3 (2026-11-24 inconsistent tier: all pages present but tables do not parse, or a driver header over a user mapping)";
 
 fn hex_number(s: &str) -> Result<u64, String> {
     let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
@@ -462,7 +462,7 @@ fn verify_existing_images(dir: &Path) -> std::io::Result<()> {
     for entry in entries {
         if !entry.file_type()?.is_file() { continue; }
         let file_name = entry.file_name().to_string_lossy().into_owned();
-        if !file_name.ends_with(".recovered.pe") && !file_name.ends_with(".code-complete.pe") &&
+        if !file_name.ends_with(".recovered.pe") && !file_name.ends_with(".code-complete.pe") && !file_name.ends_with(".inconsistent.bin") &&
             !file_name.ends_with(".partial.bin") && !file_name.ends_with(".merged.bin") { continue; }
         let metadata = entry.metadata()?;
         if metadata.len() > MAX_IMAGE as u64 { continue; }
@@ -702,45 +702,7 @@ fn eprocess_scan(input: &Path, out_dir: &Path) -> std::io::Result<()> {
             println!("[eprocess]   one spacing dominates: a region of this capture appears twice at different times (acquisition artefact), not kernel-side copies");
         }
     }
-    // Objects that only contain a DTB value but do not read as a process
-    // (PFN lists, pool copies) go to a sidecar so the main table is the
-    // process list. DUMPY_EPROCESS_ALL=1 keeps them in the main table.
-    let keep_all = std::env::var_os("DUMPY_EPROCESS_ALL").is_some();
-    let lookalikes = report.processes.iter().filter(|p| !p.plausible).count();
-    if lookalikes > 0 {
-        println!("[eprocess] {lookalikes} dtb-anchored objects do not read as processes (implausible pid/ppid/time/name); {}",
-            if keep_all { "kept in dumpy_eprocess.tsv" } else { "written to dumpy_eprocess_lookalikes.tsv" });
-    }
-    let ep_header = "source\tstate\tpid\tppid\tname\tdtb\tother_dtb\tlive_address_space\tcreate_time_utc\texit_time_utc\tin_active_list\tgroup_linked\teprocess_va\teprocess_phys\tpeb\tpeb_confirmed\tduplicate_of\tplausible\n";
-    let mut out = String::from(ep_header);
-    let mut side = String::from(ep_header);
-    for p in &report.processes {
-        let dst = if p.plausible || keep_all { &mut out } else { &mut side };
-        // Root found in RAM is not the same as process alive: a freed PML4
-        // page keeps its self-reference until reused.
-        let state = match (p.exit_time.is_some(), p.live_root, report.layout.exit_time.is_some()) {
-            (true, _, _) if p.exit_from_duplicate => "exited(this copy imaged before exit)",
-            (true, true, _) => "exited(page tables still in RAM)",
-            (true, false, _) => "exited",
-            (false, true, _) => "running",
-            (false, false, true) => "no-exit-time,root-missing",
-            (false, false, false) => "root-missing",
-        };
-        dst.push_str(&format!("{}\t{}\t{}\t{}\t{}\t0x{:x}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0x{:x}\t0x{:x}\t{}\t{}\t{}\n",
-            p.source, state, p.pid.map(|v| v.to_string()).unwrap_or_default(), p.ppid.map(|v| v.to_string()).unwrap_or_default(),
-            p.name.clone().unwrap_or_default().replace('\t', " "), p.dtb,
-            p.other_dtb.map(|v| format!("0x{v:x}")).unwrap_or_default(), p.live_root,
-            p.create_time.map(eprocess::filetime_iso).unwrap_or_default(),
-            p.exit_time.map(eprocess::filetime_iso).unwrap_or_default(),
-            p.in_active_list.map(|v| v.to_string()).unwrap_or_default(),
-            p.group_linked.map(|v| v.to_string()).unwrap_or_default(),
-            p.eprocess_va.map(|v| format!("0x{v:x}")).unwrap_or_default(),
-            p.physical.saturating_sub(report.layout.field_offset), p.peb, p.peb_confirmed,
-            p.duplicate_of.map(|d| format!("0x{:x}", d.saturating_sub(report.layout.field_offset))).unwrap_or_default(),
-            p.plausible));
-    }
-    fs::write(out_dir.join("dumpy_eprocess.tsv"), &out)?;
-    if !keep_all && lookalikes > 0 { fs::write(out_dir.join("dumpy_eprocess_lookalikes.tsv"), &side)?; }
+    eprocess::write_tsv(&report, out_dir)?;
     // Fill pid/name hints in dumpy_processes.tsv and append the new columns.
     let mut by_dtb: HashMap<u64, &eprocess::Process> = HashMap::new();
     for p in report.processes.iter().filter(|p| p.source == "dtb-anchored" && p.plausible) {
