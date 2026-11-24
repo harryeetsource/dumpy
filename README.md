@@ -1,10 +1,10 @@
 # dumpy
 
-Recover valid PE images (EXEs and DLLs) from Windows memory dumps, attribute them to the processes that had them mapped, and point out code that doesn't belong: injected, unlisted, or headerless.
+Recover valid PE images from Windows memory dumps — user-mode EXEs and DLLs, .NET assemblies, kernel drivers — attribute them to the processes that had them mapped, and point out code that doesn't belong: unlisted images, hidden drivers, and executable memory outside any image.
 
 dumpy works without symbols. It reads the page tables, PEBs, loader lists, EPROCESS objects and VAD trees straight out of physical memory, and learns the structure offsets for the kernel build it finds in the capture. That includes builds with no published layout.
 
-- Language: Rust (edition 2021), no external crates
+- Language: Rust, edition 2024 (needs Rust 1.85 or newer; developed against 1.97), no external crates
 - Version: `dumpy --version` prints the build string. Every log line of a run starts with the same string, so you can always tell which binary produced a result.
 
 ---
@@ -34,11 +34,28 @@ cargo build --release
 cargo test --release
 ```
 
-The release profile uses LTO. Nothing needs to be installed besides a Rust toolchain.
+The release profile uses LTO. Nothing needs to be installed besides a Rust toolchain, Rust 1.85 or newer (`rustup update stable`).
 
 ---
 
 ## Quick start
+
+### One command: extract everything
+
+```powershell
+.\dumpy.exe --extract-all .\complete.dmp .\out
+```
+
+This runs every phase in order and writes `out\INDEX.tsv`, one row per extracted artifact:
+
+1. **User mode:** every address space, 20 per batch, until all are covered. The EPROCESS table and VAD resolution are set up automatically.
+2. **EPROCESS:** PIDs, parents, names and create/exit times, from every validated process.
+3. **Kernel:** the loaded-module list, recovered with the same tiers and naming as user images. Unlisted kernel images whose code is mapped executable. Executable kernel memory outside every image.
+4. **Index:** `INDEX.tsv` (see [INDEX.tsv](#indextsv)).
+
+The command is safe to rerun into the same folder: finished user batches are skipped, and the kernel phase and index are rebuilt.
+
+The rest of this section runs the user-mode phase on its own, which is useful when you want different batch sizes.
 
 ### 1. Identify the dump
 
@@ -95,6 +112,7 @@ The images to analyse are `*.recovered.pe` and `*.code-complete.pe`. See [Output
 | Command | Purpose |
 |---|---|
 | `--version` | Print the build string. |
+| `--extract-all <dump> <out>` | **Everything in one pass:** user images over all address spaces, EPROCESS table, kernel modules, unlisted kernel images, unbacked kernel code, and `INDEX.tsv`. |
 | `--info <dump>` | Identify the acquisition format and size. |
 | `--recover-process-aware <dump> <out> [pages=100000] [roots=8] [root_start=0] [max_recoveries=4096] [max_module_mib=600]` | **Main workflow.** Discover address spaces, find PEBs, walk loader lists, recover images, report unlisted images and orphan executable memory. |
 | `--process-scan <dump> <out> [pages] [roots] [root_start]` | Same discovery and reports as above, without recovering images. |
@@ -159,7 +177,22 @@ The node header (RTL_BALANCED_NODE plus the MMVAD_SHORT VPN fields) is checked b
 - **Rebuild:** dumpy chooses mapped or raw layout from evidence, rebuilds the file, and validates the import and export tables.
 - **Naming**, in order: loader list, export-directory name, VERSIONINFO (`OriginalFilename` / `InternalName`), .NET Module name, then the CodeView PDB name. Roslyn script submissions are labelled.
 
-### 7. Review sets
+### 7. Kernel space (`--extract-all`)
+- **Page-table walk:** the kernel half (PML4 slots 256–511) of the kernel root is walked. The kernel root is the System process's DTB from the EPROCESS table, or the discovery heuristic when that's unavailable. Each table is descended into once, and pages whose entries mostly point outside the capture are rejected as non-tables. Transition PTEs (page on the standby list, still in RAM) count as non-executable leaves, so a header page in that state is still found. Every mapped leaf (4 KiB, 2 MiB, 1 GiB) is listed with its effective NX and writable bits.
+- **Module list:**
+  - Crash dumps: the `PsLoadedModuleList` head comes from the dump header.
+  - Raw dumps: dumpy looks for a PE header in kernel space whose export directory names itself `ntoskrnl.exe` (or `ntkrnlmp`, `ntkrnlpa`, `ntkrla57`). `PsLoadedModuleList` is one of its exports.
+  - If ntoskrnl's header isn't in the capture, the list is found by structure. Physical memory is scanned for a `KLDR_DATA_TABLE_ENTRY` whose DllBase (+0x30) and SizeOfImage (+0x40) match an image found in kernel space. The list is then followed around the ring, and the one node that isn't an entry is the head.
+  - An entry whose own header page is missing stays in the list, marked `header not in capture`. Its mapped bytes are written raw as `.headerless.bin`.
+
+  The list is walked with backlink checks.
+- **Listed modules** are recovered like user images. A module that reads better through a user address space than through the kernel root is recovered from that one and noted `session space`; that's how win32k-family drivers are reached.
+- **Unlisted kernel images:** PE headers at kernel page starts that aren't inside any listed module.
+  - If any page of the image's code is mapped executable, it's recovered and reported. Whether the header page is writable is noted, but on its own that means nothing: plenty of ordinary drivers have writable headers.
+  - Otherwise it's a PE held as data (file-cache views, pool copies) and is only counted.
+- **Unbacked kernel code:** executable kernel pages outside every listed or unlisted image are merged into regions. Each region is classified by content, the module before it is named, and a `relation` is given: `module tail` (at most 16 KiB, within 64 KiB past a module's end), `gap`, or `before first image`. Module tails show up for most modules on current builds; they're loader-made stubs, not injection. The rest are what to review. Regions are written to `kernel/orphans/` (up to 16 MiB each, 256 MiB in total).
+
+### 8. Review sets
 - **Unlisted images:** PE headers mapped in an address space but missing from its loader list.
 - **Orphan executable regions:** executable user memory not covered by any known image. Each one is classified by content and by the runtime it belongs to (.NET, V8/Chromium/Electron/CEF, JScript, JVM, CrowdStrike UMPPC).
 
@@ -169,6 +202,7 @@ The node header (RTL_BALANCED_NODE plus the MMVAD_SHORT VPN fields) is checked b
 
 ```
 out/
+├── INDEX.tsv                           every artifact, user and kernel (--extract-all)
 ├── recover.log                         (from Tee-Object)
 ├── dumpy_processes.tsv                 address spaces with a validated PEB (merged)
 ├── dumpy_modules.tsv                   loader-list modules (merged)
@@ -180,6 +214,13 @@ out/
 ├── dumpy_<table>.r<start>-<end>.tsv    per-batch tables (merged into the above)
 ├── .dumpy_batch_r<start>-<end>.done    batch completion markers
 ├── dtb_<dtb>_orphans/                  bytes of orphan executable regions
+├── kernel/                             (--extract-all)
+│   ├── <name>_0x<base>.<tier suffix>   listed modules; unlisted ones are kimage_<base>…
+│   ├── dumpy_recovery.tsv, dumpy_missing_pages.tsv, …   same reports as images/
+│   ├── dumpy_kernel_unlisted.tsv       unlisted kernel images
+│   ├── dumpy_kernel_orphans.tsv        executable kernel regions outside images
+│   ├── dumpy_kernel_index.tsv          kernel rows of INDEX.tsv
+│   └── orphans/kcode_<va>.bin          bytes of those regions
 └── images/
     ├── <name>_0x<base>.recovered.pe
     ├── <name>_0x<base>.code-complete.pe
@@ -207,6 +248,7 @@ Images without a name are written as `image_<base>_h<fingerprint>…`.
 | `.recovered.pe` | `exact` | Every page present, and the import/export tables parse (or are absent). | **Yes** |
 | `.code-complete.pe` | `code-complete` | Headers, every executable page, and the import/export directories came from memory and validate. Only non-executable data (typically `.rsrc`, `.reloc`, `.data` pages never touched) is zero-filled; the diagnostics column lists what. | **Yes**: loadable and analysable, but not byte-identical to disk |
 | `.inconsistent.bin` | `inconsistent` | Every page present, but the pages are not one image: either the tables don't parse, or a kernel driver header (ImageBase in kernel space) sits over a user mapping. Caused by stale PTEs or acquisition smear. | No; look only if you're chasing that address |
+| `.headerless.bin` | `headerless` | Kernel module from the module list whose header page is missing: its mapped bytes, written raw (missing pages zero-filled). | For strings, YARA and disassembly at the module's base |
 | `.merged.bin` | `merged` | Needed a writable (per-process) page from another address space, or address spaces disagreed on a shared page. | With care |
 | `.partial.bin` | `partial` | Pages missing beyond the code-complete bar; missing pages are zero-filled. | For strings and YARA, not execution |
 | (no file) | `unavailable` | Nothing recoverable, or section reconstruction failed. | n/a |
@@ -220,6 +262,25 @@ Use the `pdb_key` column (GUID plus age) to identify the exact build instead.
 ---
 
 ## Report reference (TSV columns)
+
+### `INDEX.tsv`
+
+One row per artifact, written by `--extract-all`.
+
+| Column | Meaning |
+|---|---|
+| `category` | `user-image`, `dotnet-assembly`, `dotnet-roslyn-script`, `user-orphan-code`, `kernel-module`, `kernel-unlisted`, `kernel-orphan-code` |
+| `name`, `name_source` | Name and where it came from: `loader list`, `kernel module list`, `export name`, `version resource`, `.NET module`, `.NET module, Roslyn script submission`, `pdb name`. Empty when unnamed. |
+| `owner` | Processes that map the image, as `name(pid)`: the first three, then `+N more`. `kernel` for kernel artifacts. |
+| `base`, `size` | Virtual base and size (span for raw regions). |
+| `tier` | `exact`, `code-complete`, `inconsistent`, `merged`, `partial`, `unavailable`, `headerless` (kernel module without a header), or `raw-region` for orphan code. |
+| `output` | File written. |
+| `notes` | `not in the loader list of …`, PDB key, content class, runtime, `session space`, `header page writable`, relation (`module tail …`, `gap`, `before first image`), `after <module>`, `large page`. |
+
+To pull out the review set:
+```powershell
+Import-Csv .\out\INDEX.tsv -Delimiter "`t" | Where-Object { $_.category -in 'kernel-unlisted','kernel-orphan-code','user-orphan-code' -or $_.notes -like 'not in the loader list*' }
+```
 
 ### `images/dumpy_recovery.tsv`
 
@@ -316,6 +377,12 @@ Objects that hold a DTB value but don't read as a process go to `dumpy_eprocess_
 | `[recover] <name> base=… available=… missing=…` | One recovery, with its diagnostics. |
 | `already completed; skipping` | Finished batch skipped (see `DUMPY_RERUN`). |
 | `[eprocess] absolute EPROCESS offsets: …` | The learned layout for this kernel build. |
+| `[kernel] first module (the kernel): … header page found / not present in the capture` | The first list entry is ntoskrnl. If its header is missing, it comes out as `.headerless.bin`. |
+| `[kernel] tables: N aliased …, M rejected …` | Shared page tables are walked once, and pages that don't look like page tables are skipped. A large rejected count means the kernel root is suspect. |
+| `[kernel] leaves per PML4 slot …` | Where the kernel mappings are, as `slot:leaves/executable`. Driver code lives in the slots with executable leaves. |
+| `[kernel] ntoskrnl.exe at 0x…; PsLoadedModuleList=0x…` | Module-list head found from ntoskrnl's export (raw dumps). |
+| `[kernel] unlisted executable images: N; PE headers in data …: M` | N images are recovered as `kernel-unlisted`; M PEs held as data are only counted. |
+| `[extract-all] INDEX.tsv: N artifacts` | Run finished. |
 
 ---
 
@@ -325,6 +392,11 @@ Objects that hold a DTB value but don't read as a process go to `dumpy_eprocess_
 - **Acquisition smear.** Live captures are taken over minutes. Objects can appear twice with drifting counters, and a PTE can point at a frame that was reused mid-capture. dumpy groups duplicate EPROCESS copies, checks shared pages against a second address space, and moves images whose pages don't form one image to the `inconsistent` tier.
 - **Freed page tables.** A self-referencing PML4 can outlive its process. `dumpy_eprocess.tsv` marks such address spaces `exited(page tables still in RAM)`.
 - **Learned, not looked-up, offsets.** EPROCESS and VAD offsets are inferred and printed in the log. If the log shows low support counts, treat PIDs, names and times as provisional.
+- **Kernel scan scope:**
+  - The kernel walk assumes 4-level paging.
+  - Large pages are searched for PE headers only at their first byte.
+  - The walk stops at 24 million leaves, with a warning in the log.
+  - Unlisted kernel images count only if their code is mapped executable. A driver copy held as data is counted in the log but not recovered.
 - **Not handled:** VAD-prototype PTE encoding (`ProtoAddress == 0xFFFFFFFF0000`), pagefile content, and the PFN database. That last one would recover pages whose prototype PTEs are in paged-out pool.
 - **KVA shadowing:** detected and reported. On shadowed systems the roots found are user CR3s.
 
@@ -336,6 +408,8 @@ Objects that hold a DTB value but don't read as a process go to `dumpy_eprocess_
 |---|---|
 | Columns or tiers described here are missing from your output | Stale binary. Check `--version` and the first log line of every batch. |
 | `process scan budget … exceeds safe cap` | `pages × roots` is above 8,000,000. Use smaller batches. |
+| `[kernel] ntoskrnl not identified … searching for the module list by structure` | ntoskrnl's header or export page isn't in the capture. The structural search normally finds the list anyway (`module list found by structure`). |
+| `[kernel] module list not found by structure either` | No list is available, so every executable kernel image is labelled `kernel-unlisted`. Read those rows with that in mind. |
 | `[vad] VAD resolution off: … not found` with an old binary | Versions before 0.14 needed `dumpy_eprocess.tsv` copied in. Current versions build it in batch 0. |
 | `EPROCESS scan failed: no EPROCESS objects confirmed` | Too few validated PEBs, or an unusual layout. Run more batches into the folder (more anchors), then run `--eprocess-scan` on it. The `tried +0x… scores:` lines show which field failed to learn. |
 | Results look truncated after running the loop twice into one folder | Pre-0.14.1 behaviour. Current versions skip finished batches. Start a fresh folder for a clean set. |
@@ -358,7 +432,7 @@ Unit tests cover:
 - export and version naming;
 - PE validation.
 
-`tests_fixture_make_flat.py` builds `flat.bin`, a synthetic flat physical image that exercises the whole pipeline:
+`tests_fixture_make_flat.py` builds `flat.bin`, a synthetic flat physical image that exercises the whole pipeline, kernel phase included:
 - two address spaces and a System-like kernel root;
 - a PEB reached through a TEB, and a loader list;
 - a shared DLL that needs a borrowed read-only page;
@@ -367,12 +441,20 @@ Unit tests cover:
 - an unlisted image and an orphan executable page;
 - a prototype-pointer PTE;
 - EPROCESS-like objects with `DISPATCHER_HEADER`s;
-- a three-node VAD tree with prototype PTE arrays.
+- a three-node VAD tree with prototype PTE arrays;
+- in kernel space:
+  - an `ntoskrnl.exe` exporting `PsLoadedModuleList`, and a two-entry module list (`ntoskrnl.exe`, `listed.sys`);
+  - an unlisted driver with executable code and a writable header;
+  - a PE held as data (NX code), which is counted but not recovered;
+  - one executable page outside every image.
 
 ```bash
 python3 tests_fixture_make_flat.py          # writes flat.bin
-dumpy --recover-process-aware flat.bin out_fixture
-ls out_fixture/images                       # expect recovered.pe ×2, code-complete.pe, merged.bin
+dumpy --extract-all flat.bin out_fixture
+ls out_fixture/images                       # recovered.pe ×2, code-complete.pe, merged.bin
+ls out_fixture/kernel                       # ntoskrnl.exe and listed.sys .recovered.pe, kimage_… .recovered.pe
 ```
+
+The kernel summary line should read `2 listed modules, 1 unlisted executable images, 1 PE headers in data, 1 executable regions outside images`. `INDEX.tsv` has 11 rows.
 
 The first batch builds the EPROCESS file and learns `VadRoot=+0x700` and `FirstPrototypePte=+0x50` from the fixture.

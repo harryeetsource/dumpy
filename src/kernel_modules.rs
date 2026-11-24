@@ -77,6 +77,16 @@ fn parse_entry(memory: &mut PhysicalMemory<'_>, dtb: u64, entry: u64) -> io::Res
         return Ok(KernelModule { entry, image_base: base, image_size: size,
             name_status: if name.is_some() { "read" } else { "unavailable" }, name });
     }
+    // The entry can outlive its header page (paged out, or not captured):
+    // keep it when the standard x64 layout reads sanely and names itself.
+    if let (Some(base), Some(size)) = (u64_at(&bytes, 0x30), u32_at(&bytes, 0x40)) {
+        if base >> 48 == 0xffff && base & 0xfff == 0 && (0x1000..=600 * 1024 * 1024).contains(&size) {
+            if let Some(name) = read_unicode_name(memory, dtb, &bytes, 0x58) {
+                return Ok(KernelModule { entry, image_base: base, image_size: size,
+                    name_status: "read (header not in capture)", name: Some(name) });
+            }
+        }
+    }
     Err(invalid("module entry has no validated image base"))
 }
 

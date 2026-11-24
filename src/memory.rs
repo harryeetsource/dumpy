@@ -124,6 +124,9 @@ impl<'a> PhysicalMemory<'a> {
 
     pub fn segments(&self) -> &[crashdump::Segment] { &self.segments }
 
+    /// Highest physical address + 1 covered by the capture.
+    pub fn physical_end(&self) -> u64 { self.top_of_memory }
+
     pub fn read_exact_at(&mut self, physical: u64, target: &mut [u8]) -> io::Result<()> {
         let mut completed = 0usize;
         while completed < target.len() {

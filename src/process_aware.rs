@@ -141,38 +141,36 @@ fn recover_identity(mem: &mut PhysicalMemory<'_>, key: Key, identity: &Identity,
     let module = KernelModule { entry: 0, image_base: base, image_size: size,
         name: Some(name), name_status: status };
     let mut record = recovery::recover_from_roots(mem, &ordered, &module, dir)?;
-    // Synthetic name: export directory, then the version resource
-    // (OriginalFilename/InternalName), of what was just written.
-    if identity.names.is_empty() {
-        if let Some(path) = record.output.clone() {
-            if let Ok(bytes) = fs::read(&path) {
-                // Export name, then VERSIONINFO, then the .NET Module name
-                // (the assembly's own file name), then the CodeView PDB name.
-                let found = Pe::parse(&bytes).ok().and_then(|pe|
-                    pe.export_name(&bytes).map(|n| (n, "export name"))
-                        .or_else(|| pe.version_name(&bytes).map(|n| (n, "version resource")))
-                        .or_else(|| pe.clr_module_name(&bytes).map(|n| {
-                            let kind = if n.starts_with('ℛ') { ".NET module, Roslyn script submission" } else { ".NET module" };
-                            (n, kind)
-                        }))
-                        .or_else(|| pe.pdb_info(&bytes).map(|(p, _)| (Pe::pdb_leaf(&p).to_string(), "pdb name"))));
-                if let Some((name, source)) = found {
-                    let safe: String = name.chars().map(|c|
-                        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
-                        .take(100).collect();
-                    let old = PathBuf::from(&path);
-                    let file_name = old.file_name().map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let new = old.with_file_name(format!("{safe}__{file_name}"));
-                    if fs::rename(&old, &new).is_ok() {
-                        record.output = Some(new.to_string_lossy().into_owned());
-                        record.name = format!("{safe} ({source})");
-                    }
-                }
-            }
-        }
-    }
+    // Synthetic name from what was just written.
+    if identity.names.is_empty() { apply_recovered_name(&mut record); }
     Ok(record)
+}
+
+/// Name an image the loader never named, from the file just written:
+/// export directory, then VERSIONINFO, then the .NET Module name, then the
+/// CodeView PDB name. Renames the file to `<name>__<old name>`.
+pub fn apply_recovered_name(record: &mut recovery::RecoveryRecord) {
+    let Some(path) = record.output.clone() else { return };
+    let Ok(bytes) = fs::read(&path) else { return };
+    let found = Pe::parse(&bytes).ok().and_then(|pe|
+        pe.export_name(&bytes).map(|n| (n, "export name"))
+            .or_else(|| pe.version_name(&bytes).map(|n| (n, "version resource")))
+            .or_else(|| pe.clr_module_name(&bytes).map(|n| {
+                let kind = if n.starts_with('ℛ') { ".NET module, Roslyn script submission" } else { ".NET module" };
+                (n, kind)
+            }))
+            .or_else(|| pe.pdb_info(&bytes).map(|(p, _)| (Pe::pdb_leaf(&p).to_string(), "pdb name"))));
+    let Some((name, source)) = found else { return };
+    let safe: String = name.chars().map(|c|
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .take(100).collect();
+    let old = PathBuf::from(&path);
+    let file_name = old.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let new = old.with_file_name(format!("{safe}__{file_name}"));
+    if fs::rename(&old, &new).is_ok() {
+        record.output = Some(new.to_string_lossy().into_owned());
+        record.name = format!("{safe} ({source})");
+    }
 }
 
 /// FNV-1a over one 4 KiB page; None for an all-zero page, which would
@@ -185,7 +183,7 @@ fn page_hash(page: &[u8]) -> Option<u64> {
 /// Coarse content class of sampled pages: executable mappings that hold
 /// text or XML are either data mis-flagged executable or an acquisition
 /// smear (PTEs captured at one time, physical pages at another).
-fn classify_pages(pages: &[Vec<u8>]) -> &'static str {
+pub fn classify_pages(pages: &[Vec<u8>]) -> &'static str {
     if pages.is_empty() { return "unsampled"; }
     let (mut total, mut zero, mut printable, mut codeish) = (0usize, 0usize, 0usize, 0usize);
     for page in pages {

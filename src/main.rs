@@ -14,6 +14,8 @@ mod recovery;
 mod rebuild;
 mod user_images;
 mod vad;
+mod kernel_scan;
+mod index;
 
 use rebuild::{Pe, MAX_IMAGE};
 use std::collections::{HashMap, HashSet};
@@ -22,7 +24,7 @@ use std::io::Write;
 use std::path::Path;
 
 /// Bumped on every report-format change so a log line identifies the build.
-pub const VERSION: &str = "0.14.3 (2026-11-24 inconsistent tier: all pages present but tables do not parse, or a driver header over a user mapping)";
+pub const VERSION: &str = "0.15.3 (2026-11-24 kernel: transition-PTE header pages, module-tail stubs labelled)";
 
 fn hex_number(s: &str) -> Result<u64, String> {
     let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
@@ -338,7 +340,7 @@ fn recover_raw_user_images(file: &mut File, output: &Path,
 /// separate --recover-user fallback path. The heavy lifting is in
 /// `process_aware`; this resolves roots and the EPROCESS pid/name hints.
 fn recover_process_aware(input: &Path, output: &Path, limits: &process_aware::Limits)
-                         -> std::io::Result<()> {
+                         -> std::io::Result<usize> {
     use std::io::{Error, ErrorKind};
     if limits.page_limit == 0 || limits.root_limit == 0 {
         return Err(Error::new(ErrorKind::InvalidInput,
@@ -397,8 +399,78 @@ fn recover_process_aware(input: &Path, output: &Path, limits: &process_aware::Li
             format!("root start {} exceeds discovered root count {}", limits.root_start, roots.len())));
     }
     drop(physical);
+    let total = roots.len();
     process_aware::run(input, output, roots.into_iter().map(|r| r.physical).collect(), kernel_root,
-        &pid_by_dtb, limits)
+        &pid_by_dtb, limits)?;
+    Ok(total)
+}
+
+/// Everything in one pass: user images in batches over every root, the
+/// EPROCESS table, kernel modules (listed and unlisted) and unbacked
+/// kernel code, then INDEX.tsv.
+fn extract_all(input: &Path, output: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    fs::create_dir_all(output)?;
+    let started = std::time::Instant::now();
+    println!("[extract-all] dumpy {VERSION}");
+    // 1. User mode, 20 roots per batch until every root is covered.
+    let mut start = 0usize;
+    loop {
+        let limits = process_aware::Limits { page_limit: 200_000, root_limit: 20, root_start: start,
+            max_recoveries: 4096, max_module_bytes: MAX_IMAGE as u64, scan_only: false };
+        let total = match recover_process_aware(input, output, &limits) {
+            Ok(total) => total,
+            Err(e) if start > 0 && e.kind() == ErrorKind::InvalidInput => break,
+            Err(e) => return Err(e),
+        };
+        start += 20;
+        println!("[extract-all] user batches: {}/{} roots done; {:.0?}", start.min(total), total, started.elapsed());
+        if start >= total { break; }
+    }
+    // 2. EPROCESS table from every anchor (PIDs, parents, times, names).
+    if let Err(e) = eprocess_scan(input, output) { println!("[extract-all] EPROCESS scan: {e}"); }
+    // 3. Kernel space.
+    let mut file = File::open(input)?;
+    let format = memory::identify(&mut file)?;
+    let crash = if format == memory::DumpFormat::WindowsCrashDump { Some(crashdump::parse(&mut file)?) } else { None };
+    let mut physical = memory::PhysicalMemory::new(&mut file)?;
+    let (kernel_root, session_root, head) = if let Some(info) = &crash {
+        let mut roots = discovery::discover_candidate_roots(&mut physical, 8192)?;
+        roots.retain(|r| r.user_entries > 0);
+        roots.sort_by(|a, b| b.user_entries.cmp(&a.user_entries));
+        (info.dtb, roots.first().map(|r| r.physical), (info.kernel_module_list != 0).then_some(info.kernel_module_list))
+    } else {
+        let (roots, kernel_root) = coherent_raw_roots(&mut physical)?;
+        let kernel_root = kernel_root.ok_or_else(|| Error::new(ErrorKind::InvalidData, "no kernel root"))?;
+        (kernel_root, roots.first().map(|r| r.physical), None)
+    };
+    // The System process's own DTB, when the EPROCESS table has it, is the
+    // most reliable kernel root; the discovery heuristic is the fallback.
+    let system_dtb = fs::read_to_string(output.join("dumpy_eprocess.tsv")).ok().and_then(|t| {
+        let mut lines = t.lines();
+        let h: Vec<&str> = lines.next()?.split('\t').collect();
+        let (cp, cn, cd, cs) = (h.iter().position(|c| *c == "pid")?, h.iter().position(|c| *c == "name")?,
+            h.iter().position(|c| *c == "dtb")?, h.iter().position(|c| *c == "state")?);
+        lines.map(|l| l.split('\t').collect::<Vec<_>>())
+            .find(|f| f.get(cp) == Some(&"4") && f.get(cn) == Some(&"System") && f.get(cs) == Some(&"running"))
+            .and_then(|f| u64::from_str_radix(f[cd].trim_start_matches("0x"), 16).ok())
+    });
+    let kernel_root = match system_dtb {
+        Some(d) if crash.is_none() && d != kernel_root => {
+            println!("[extract-all] kernel root: System DTB 0x{d:x} (discovery chose 0x{kernel_root:x})"); d
+        }
+        _ => kernel_root,
+    };
+    physical.kernel_root = Some(kernel_root);
+    match kernel_scan::run(&mut physical, kernel_root, session_root, head, &output.join("kernel")) {
+        Ok(s) => println!("[extract-all] kernel: {} listed modules, {} unlisted executable images, {} PE headers in data, {} executable regions outside images",
+            s.listed, s.unlisted, s.data_views, s.orphan_regions),
+        Err(e) => println!("[extract-all] kernel phase failed: {e}"),
+    }
+    // 4. Index.
+    let rows = index::write(output)?;
+    println!("[extract-all] INDEX.tsv: {rows} artifacts; done in {:.0?}", started.elapsed());
+    Ok(())
 }
 
 /// Rank candidate address spaces cheaply before reconstructing the entire PE.
@@ -974,7 +1046,7 @@ fn main() {
         let limits = process_aware::Limits { page_limit, root_limit, root_start,
             max_recoveries, max_module_bytes: max_module_mib as u64 * 1024 * 1024,
             scan_only: args[1] == "--process-scan" };
-        if let Err(e) = recover_process_aware(Path::new(&args[2]), Path::new(&args[3]), &limits) {
+        if let Err(e) = recover_process_aware(Path::new(&args[2]), Path::new(&args[3]), &limits).map(|_| ()) {
             eprintln!("Process-aware recovery failed: {e}"); std::process::exit(1);
         }
         return;
@@ -992,6 +1064,12 @@ fn main() {
         let images = read_limit(6, 4096, "max_images_per_root");
         if let Err(e) = recover_user_images(Path::new(&args[2]), Path::new(&args[3]), pages, roots, images) {
             eprintln!("User PE recovery failed: {e}"); std::process::exit(1);
+        }
+        return;
+    }
+    if args.len() == 4 && args[1] == "--extract-all" {
+        if let Err(e) = extract_all(Path::new(&args[2]), Path::new(&args[3])) {
+            eprintln!("Extraction failed: {e}"); std::process::exit(1);
         }
         return;
     }
@@ -1029,6 +1107,7 @@ fn main() {
     }
     if args.len() != 3 {
         eprintln!("Usage: {} <input_file> <output_directory>", args.first().map(|s| s.to_string_lossy()).unwrap_or_default());
+        eprintln!("       --extract-all <dump> <output_dir>   (user + kernel images, assemblies, unbacked code, INDEX.tsv)");
         eprintln!("       --info <dump>");
         eprintln!("       --discover <verified_flat_dump>");
         eprintln!("       --modules <windows_crash_dump>");
