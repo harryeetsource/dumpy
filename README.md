@@ -181,7 +181,7 @@ The node header (RTL_BALANCED_NODE plus the MMVAD_SHORT VPN fields) is checked b
 - **Page-table walk:** the kernel half (PML4 slots 256–511) of the kernel root is walked. The kernel root is the System process's DTB from the EPROCESS table, or the discovery heuristic when that's unavailable. Each table is descended into once, and pages whose entries mostly point outside the capture are rejected as non-tables. Transition PTEs (page on the standby list, still in RAM) count as non-executable leaves, so a header page in that state is still found. Every mapped leaf (4 KiB, 2 MiB, 1 GiB) is listed with its effective NX and writable bits.
 - **Module list:**
   - Crash dumps: the `PsLoadedModuleList` head comes from the dump header.
-  - Raw dumps: dumpy looks for a PE header in kernel space whose export directory names itself `ntoskrnl.exe` (or `ntkrnlmp`, `ntkrnlpa`, `ntkrla57`). `PsLoadedModuleList` is one of its exports.
+  - Raw dumps: dumpy looks for a PE header in kernel space whose export directory names itself `ntoskrnl.exe` (or `ntkrnlmp`, `ntkrnlpa`, `ntkrla57`). `PsLoadedModuleList` is one of its exports. More than one image can carry that name: on a hotpatched system `ntkrnlmp_hotpatch.exe` does, and its export is not the live list. So every candidate's list is walked, and the longest complete one is used.
   - If ntoskrnl's header isn't in the capture, the list is found by structure. Physical memory is scanned for a `KLDR_DATA_TABLE_ENTRY` whose DllBase (+0x30) and SizeOfImage (+0x40) match an image found in kernel space. The list is then followed around the ring, and the one node that isn't an entry is the head.
   - An entry whose own header page is missing stays in the list, marked `header not in capture`. Its mapped bytes are written raw as `.headerless.bin`.
 
@@ -380,7 +380,8 @@ Objects that hold a DTB value but don't read as a process go to `dumpy_eprocess_
 | `[kernel] first module (the kernel): … header page found / not present in the capture` | The first list entry is ntoskrnl. If its header is missing, it comes out as `.headerless.bin`. |
 | `[kernel] tables: N aliased …, M rejected …` | Shared page tables are walked once, and pages that don't look like page tables are skipped. A large rejected count means the kernel root is suspect. |
 | `[kernel] leaves per PML4 slot …` | Where the kernel mappings are, as `slot:leaves/executable`. Driver code lives in the slots with executable leaves. |
-| `[kernel] ntoskrnl.exe at 0x…; PsLoadedModuleList=0x…` | Module-list head found from ntoskrnl's export (raw dumps). |
+| `[kernel] ntoskrnl.exe at 0x…: PsLoadedModuleList=0x… -> N modules` | One line per image that exports the kernel's name, with the size of the list it leads to. |
+| `[kernel] using the module list of … (N modules)` | The candidate chosen. |
 | `[kernel] unlisted executable images: N; PE headers in data …: M` | N images are recovered as `kernel-unlisted`; M PEs held as data are only counted. |
 | `[extract-all] INDEX.tsv: N artifacts` | Run finished. |
 
@@ -446,6 +447,7 @@ Unit tests cover:
   - an `ntoskrnl.exe` exporting `PsLoadedModuleList`, and a two-entry module list (`ntoskrnl.exe`, `listed.sys`);
   - an unlisted driver with executable code and a writable header;
   - a PE held as data (NX code), which is counted but not recovered;
+  - a hotpatch-style decoy below the kernel that also exports `ntoskrnl.exe`, with an empty `PsLoadedModuleList`; it must be rejected;
   - one executable page outside every image.
 
 ```bash
@@ -455,6 +457,6 @@ ls out_fixture/images                       # recovered.pe ×2, code-complete.pe
 ls out_fixture/kernel                       # ntoskrnl.exe and listed.sys .recovered.pe, kimage_… .recovered.pe
 ```
 
-The kernel summary line should read `2 listed modules, 1 unlisted executable images, 1 PE headers in data, 1 executable regions outside images`. `INDEX.tsv` has 11 rows.
+The log should show the decoy tried and rejected (`-> 0 modules`), then `using the module list of ntoskrnl.exe at 0xffff800000100000 (2 modules)`. The kernel summary line should read `2 listed modules, 2 unlisted executable images, 1 PE headers in data, 1 executable regions outside images` (the decoy and `hidden.sys` are the unlisted pair). `INDEX.tsv` has 12 rows.
 
 The first batch builds the EPROCESS file and learns `VadRoot=+0x700` and `FirstPrototypePte=+0x50` from the fixture.

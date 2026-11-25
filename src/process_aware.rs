@@ -287,6 +287,20 @@ pub fn run(input: &Path, output: &Path, roots: Vec<u64>, kernel_root: Option<u64
         persisted.retain(|_, p| p.batch != batch);
         println!("[process-aware] {} identities from the previous run of {batch} will be recovered again", before - persisted.len());
     }
+    // An identity is only "done" while the marker of the batch that
+    // recovered it exists. A folder whose markers were removed (top level
+    // cleaned, images\ kept) must not make later batches skip everything.
+    {
+        let before = persisted.len();
+        let any_marker = fs::read_dir(output).map(|d| d.flatten().any(|e|
+            e.file_name().to_string_lossy().starts_with(".dumpy_batch_"))).unwrap_or(false);
+        persisted.retain(|_, p| if p.batch.is_empty() { any_marker }
+            else { output.join(format!(".dumpy_batch_{}.done", p.batch)).exists() });
+        if persisted.len() < before {
+            println!("[process-aware] {} remembered identities ignored: the batches that recovered them have no completion marker in {} (they will be recovered again)",
+                before - persisted.len(), output.display());
+        }
+    }
     if !persisted.is_empty() {
         println!("[process-aware] {} identities carried over from earlier batches", persisted.len());
     }

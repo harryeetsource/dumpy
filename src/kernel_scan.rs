@@ -185,7 +185,9 @@ pub fn find_headers(mem: &mut PhysicalMemory<'_>, leaves: &[Leaf]) -> Vec<Header
     let mut order: Vec<(u64, u64)> = leaves.iter().filter(|l| l.size <= 2 << 20).map(|l| (l.phys, l.va)).collect();
     order.sort_unstable();
     let mut found = Vec::new();
-    let mut buf = [0u8; 0x400];
+    // The whole header page: large images (ntoskrnl has 30+ sections)
+    // carry section tables well past the first 0x400 bytes.
+    let mut buf = [0u8; 0x1000];
     for (phys, va) in order {
         let mut mz = [0u8; 2];
         if mem.read_exact_at(phys, &mut mz).is_err() || mz != *b"MZ" { continue; }
@@ -198,7 +200,9 @@ pub fn find_headers(mem: &mut PhysicalMemory<'_>, leaves: &[Leaf]) -> Vec<Header
 }
 
 fn read_cstr(mem: &mut PhysicalMemory<'_>, root: u64, va: u64) -> Option<String> {
-    let mut b = [0u8; 96];
+    // Never read across into the next page: it may be absent.
+    let len = (4096 - (va & 0xfff) as usize).min(96);
+    let mut b = vec![0u8; len];
     mem.read_virtual(root, va, &mut b, 4).ok()?;
     let end = b.iter().position(|c| *c == 0)?;
     std::str::from_utf8(&b[..end]).ok().map(str::to_owned)
@@ -347,25 +351,41 @@ pub fn run(mem: &mut PhysicalMemory<'_>, root: u64, session_root: Option<u64>,
     let headers = find_headers(mem, &leaves);
     println!("[kernel] {} PE headers at kernel page starts; {:.0?}", headers.len(), started.elapsed());
 
-    // Module list head: crash-dump header, else ntoskrnl's export.
+    // Module list head: crash-dump header, else ntoskrnl's export. Several
+    // images can export the kernel's name (hotpatch images such as
+    // ntkrnlmp_hotpatch.exe do), and their PsLoadedModuleList export is not
+    // the live list: try each and keep the head that yields the longest
+    // complete list.
     let mut head = list_head;
     let mut kernel_image = None;
-    for h in &headers {
-        if let Some((name, f)) = export_dir(mem, root, h) {
-            if KERNEL_NAMES.iter().any(|k| name.eq_ignore_ascii_case(k)) {
-                kernel_image = Some(name.clone());
-                if head.is_none() {
-                    head = export_address(mem, root, h, &f, "PsLoadedModuleList");
-                }
-                println!("[kernel] {name} at 0x{:x}; PsLoadedModuleList={}", h.base,
-                    head.map(|v| format!("0x{v:x}")).unwrap_or_else(|| "not resolved".into()));
-                break;
+    if head.is_none() {
+        let mut best: Option<(usize, u64, u64, String)> = None;
+        for h in &headers {
+            let Some((name, f)) = export_dir(mem, root, h) else { continue };
+            if !KERNEL_NAMES.iter().any(|k| name.eq_ignore_ascii_case(k)) { continue; }
+            let Some(candidate) = export_address(mem, root, h, &f, "PsLoadedModuleList") else {
+                println!("[kernel] {name} at 0x{:x}: PsLoadedModuleList not resolved", h.base);
+                continue;
+            };
+            let count = match kernel_modules::enumerate(mem, root, candidate, 4096) {
+                Ok(scan) if scan.complete => scan.modules.len(),
+                Ok(scan) => scan.modules.len() / 2,
+                Err(_) => 0,
+            };
+            println!("[kernel] {name} at 0x{:x}: PsLoadedModuleList=0x{candidate:x} -> {count} modules", h.base);
+            if count >= 2 && best.as_ref().is_none_or(|b| count > b.0) {
+                best = Some((count, candidate, h.base, name));
             }
+        }
+        if let Some((count, candidate, base, name)) = best {
+            println!("[kernel] using the module list of {name} at 0x{base:x} ({count} modules)");
+            head = Some(candidate);
+            kernel_image = Some(name);
         }
     }
     if head.is_none() {
         if kernel_image.is_none() {
-            println!("[kernel] ntoskrnl not identified by its export directory; searching for the module list by structure");
+            println!("[kernel] no kernel-named image yields a module list through its export; searching for the module list by structure");
         }
         let executable: Vec<Header> = headers.iter().filter(|h| code_is_executable(&leaves, h)).cloned().collect();
         head = find_list_structurally(mem, root, &executable);
@@ -385,6 +405,21 @@ pub fn run(mem: &mut PhysicalMemory<'_>, root: u64, session_root: Option<u64>,
                     println!("[kernel] first module (the kernel): {} at 0x{:x} size 0x{:x}; header page {}",
                         first.name.clone().unwrap_or_default(), first.image_base, first.image_size,
                         if seen { "readable" } else { "not readable in the capture" });
+                    if kernel_image.is_none() {
+                        // Why the export route missed it.
+                        let found = headers.iter().find(|h| h.base == first.image_base);
+                        let leaf = leaf_for(&leaves, first.image_base);
+                        let why = match found {
+                            None => format!("header not at a scanned leaf start (leaf {})",
+                                leaf.map(|l| format!("va=0x{:x} size=0x{:x}", l.va, l.size)).unwrap_or_else(|| "absent".into())),
+                            Some(h) if h.export_rva == 0 => "header has no export directory".into(),
+                            Some(h) => match export_dir(mem, root, h) {
+                                Some((name, _)) => format!("export directory names it {name:?}"),
+                                None => format!("export directory at rva 0x{:x} unreadable", h.export_rva),
+                            },
+                        };
+                        println!("[kernel] export route diagnosis: {why}");
+                    }
                 }
                 modules = scan.modules;
             }
@@ -557,6 +592,27 @@ mod tests {
         assert_eq!(split_name("foo.dll (export name)"), ("foo.dll".into(), "export name".into()));
         assert_eq!(split_name("ntoskrnl.exe"), ("ntoskrnl.exe".into(), "loader list".into()));
         assert_eq!(split_name("image_1000_h00"), ("image_1000_h00".into(), String::new()));
+    }
+    #[test]
+    fn parses_headers_with_long_section_tables() {
+        let mut b = vec![0u8; 0x1000];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&0x108u32.to_le_bytes());
+        b[0x108..0x10c].copy_from_slice(b"PE\0\0");
+        b[0x10c..0x10e].copy_from_slice(&0x8664u16.to_le_bytes());
+        b[0x10e..0x110].copy_from_slice(&36u16.to_le_bytes());      // 36 sections, like ntoskrnl
+        b[0x11c..0x11e].copy_from_slice(&0xf0u16.to_le_bytes());
+        let opt = 0x120;
+        b[opt..opt + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        b[opt + 56..opt + 60].copy_from_slice(&0x145_0000u32.to_le_bytes());
+        // last section is executable, at the very end of the table (> 0x400)
+        let last = opt + 0xf0 + 35 * 40;
+        b[last + 8..last + 12].copy_from_slice(&0x1000u32.to_le_bytes());
+        b[last + 12..last + 16].copy_from_slice(&0x20_0000u32.to_le_bytes());
+        b[last + 36..last + 40].copy_from_slice(&0x6000_0020u32.to_le_bytes());
+        let h = parse_header(0xfffff806cc000000, &b).expect("36-section header parses");
+        assert_eq!(h.exec_sections, vec![(0x20_0000, 0x1000)]);
+        assert!(parse_header(0, &b[..0x400]).is_none());               // the old 0x400 read failed here
     }
     #[test]
     fn leaf_lookup_handles_large_pages() {

@@ -24,7 +24,7 @@ use std::io::Write;
 use std::path::Path;
 
 /// Bumped on every report-format change so a log line identifies the build.
-pub const VERSION: &str = "0.15.3 (2026-11-24 kernel: transition-PTE header pages, module-tail stubs labelled)";
+pub const VERSION: &str = "0.15.6 (2026-11-24 kernel: validate every ntoskrnl-named export; hotpatch images no longer hijack the module list)";
 
 fn hex_number(s: &str) -> Result<u64, String> {
     let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
